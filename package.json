@@ -4,10 +4,9 @@
   "description": "Sofia — Agente WhatsApp Fan Fave",
   "type": "module",
   "main": "server.js",
-"scripts": {
-  "start": "node server.js"
-}
-    "dev": "node --watch src/server.js"
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node --watch server.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.30.0",
