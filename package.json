@@ -1,17 +1,20 @@
 {
-  "name": "sofia-sdr-fanfave",
+  "name": "fanfave-sofia",
   "version": "1.0.0",
+  "description": "Sofia — Agente WhatsApp Fan Fave",
   "type": "module",
-  "engines": {
-    "node": ">=18"
-  },
+  "main": "src/server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.39.0",
-    "dotenv": "^16.4.5",
-    "express": "^4.18.3",
-    "node-fetch": "^3.3.2"
+    "@anthropic-ai/sdk": "^0.30.0",
+    "cors": "^2.8.5",
+    "express": "^4.19.2",
+    "pg": "^8.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
   }
 }
