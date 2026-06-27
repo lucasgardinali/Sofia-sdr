@@ -3,9 +3,10 @@
   "version": "1.0.0",
   "description": "Sofia — Agente WhatsApp Fan Fave",
   "type": "module",
-  "main": "src/server.js",
-  "scripts": {
-    "start": "node src/server.js",
+  "main": "server.js",
+"scripts": {
+  "start": "node server.js"
+}
     "dev": "node --watch src/server.js"
   },
   "dependencies": {
