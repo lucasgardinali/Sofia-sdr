@@ -47,10 +47,18 @@ async function setupDb() {
     `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS followup_1h BOOLEAN DEFAULT false`,
     `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS followup_24h BOOLEAN DEFAULT false`,
     `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS followup_7d BOOLEAN DEFAULT false`,
+    `ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao TIMESTAMPTZ`,
+    `ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao_desc TEXT`,
   ];
   for (const col of cols) {
     try { await db.query(col); } catch (_) {}
   }
+
+  // Remove o CHECK constraint antigo do status e recria com 'arquivado' incluído
+  try {
+    await db.query(`ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_status_check`);
+    await db.query(`ALTER TABLE leads ADD CONSTRAINT leads_status_check CHECK (status IN ('novo','contato','demo','negociacao','fechado','arquivado'))`);
+  } catch (_) {}
 
   console.log("✅ Banco configurado");
 }
