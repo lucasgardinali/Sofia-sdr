@@ -461,15 +461,19 @@ app.post("/api/leads", async (req, res) => {
 
 app.patch("/api/leads/:id", async (req, res) => {
   try {
-    const { status, notas, nome, estabelecimento, tipo, cidade, email, origem } = req.body;
+    const { status, notas, nome, estabelecimento, tipo, cidade, email, origem, proxima_acao, proxima_acao_desc } = req.body;
+    try { await db.query('ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao TIMESTAMPTZ'); await db.query('ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao_desc TEXT'); } catch(_) {}
     const result = await db.query(
       `UPDATE leads SET
         status = COALESCE($1,status), notas = COALESCE($2,notas),
         nome = COALESCE($3,nome), estabelecimento = COALESCE($4,estabelecimento),
         tipo = COALESCE($5,tipo), cidade = COALESCE($6,cidade),
-        email = COALESCE($7,email), origem = COALESCE($8,origem), atualizado = NOW()
-       WHERE id = $9 RETURNING *`,
-      [status, notas, nome, estabelecimento, tipo, cidade, email, origem, req.params.id]
+        email = COALESCE($7,email), origem = COALESCE($8,origem),
+        proxima_acao = $9, proxima_acao_desc = $10,
+        atualizado = NOW()
+       WHERE id = $11 RETURNING *`,
+      [status, notas, nome, estabelecimento, tipo, cidade, email, origem,
+       proxima_acao ?? null, proxima_acao_desc ?? null, req.params.id]
     );
     if (!result.rows.length) return res.status(404).json({ ok: false, error: "Lead não encontrado" });
     res.json({ ok: true, lead: result.rows[0] });
