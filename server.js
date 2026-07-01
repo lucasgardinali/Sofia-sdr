@@ -11,19 +11,9 @@ app.use(express.json());
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const db = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// ─── SESSÕES EM MEMÓRIA ──────────────────────────────────────────────────────
+// ─── SESSÕES EM MEMÓRIA (cache rápido) ───────────────────────────────────────
 const sessions = new Map();
 const SESSION_TTL = 30 * 60 * 1000;
-
-function getSession(phone) {
-  const now = Date.now();
-  if (!sessions.has(phone)) {
-    sessions.set(phone, { history: [], lastActivity: now, qualified: false });
-  }
-  const session = sessions.get(phone);
-  session.lastActivity = now;
-  return session;
-}
 
 setInterval(() => {
   const now = Date.now();
@@ -31,6 +21,82 @@ setInterval(() => {
     if (now - session.lastActivity > SESSION_TTL) sessions.delete(phone);
   }
 }, 10 * 60 * 1000);
+
+// ─── MEMÓRIA PERSISTENTE NO BANCO ────────────────────────────────────────────
+async function loadSession(phone) {
+  try {
+    // Cria tabela de sessões se não existir
+    await db.query(`
+      CREATE TABLE IF NOT EXISTS sofia_sessions (
+        phone TEXT PRIMARY KEY,
+        history JSONB DEFAULT '[]',
+        qualified BOOLEAN DEFAULT false,
+        nome TEXT,
+        estabelecimento TEXT,
+        updated_at TIMESTAMPTZ DEFAULT NOW()
+      )
+    `);
+
+    const result = await db.query(
+      "SELECT * FROM sofia_sessions WHERE phone = $1",
+      [phone]
+    );
+
+    if (result.rows.length > 0) {
+      const row = result.rows[0];
+      return {
+        history: row.history || [],
+        qualified: row.qualified || false,
+        nome: row.nome || null,
+        estabelecimento: row.estabelecimento || null,
+        lastActivity: Date.now(),
+        fromDb: true,
+      };
+    }
+  } catch (err) {
+    console.error("Erro ao carregar sessão:", err.message);
+  }
+
+  return { history: [], qualified: false, nome: null, estabelecimento: null, lastActivity: Date.now(), fromDb: false };
+}
+
+async function saveSession(phone, session) {
+  try {
+    await db.query(
+      `INSERT INTO sofia_sessions (phone, history, qualified, nome, estabelecimento, updated_at)
+       VALUES ($1, $2, $3, $4, $5, NOW())
+       ON CONFLICT (phone) DO UPDATE SET
+         history = $2,
+         qualified = $3,
+         nome = $4,
+         estabelecimento = $5,
+         updated_at = NOW()`,
+      [
+        phone,
+        JSON.stringify(session.history),
+        session.qualified,
+        session.nome || null,
+        session.estabelecimento || null,
+      ]
+    );
+  } catch (err) {
+    console.error("Erro ao salvar sessão:", err.message);
+  }
+}
+
+async function getSession(phone) {
+  // Verifica cache em memória primeiro
+  if (sessions.has(phone)) {
+    const session = sessions.get(phone);
+    session.lastActivity = Date.now();
+    return session;
+  }
+
+  // Busca no banco se não estiver em memória
+  const session = await loadSession(phone);
+  sessions.set(phone, session);
+  return session;
+}
 
 // ─── PROMPT DA SOFIA ─────────────────────────────────────────────────────────
 const SOFIA_SYSTEM = `Você é Sofia, assistente comercial do Fan Fave — plataforma de fidelização digital para negócios de food service (restaurantes, lanchonetes, bares, cafeterias, padarias, food trucks e similares) em Montes Claros e região.
@@ -52,9 +118,9 @@ SEU FLUXO DE CONVERSA:
 4. Apresentar brevemente o Fan Fave focando na dor (cliente que não volta)
 5. Perguntar se faz sentido para o negócio deles
 6. Se interesse demonstrado: propor conversa com o time e perguntar melhor horário
-7. Se interesse alto: marcar como LEAD QUALIFICADO
+7. Se interesse alto: marcar como lead qualificado
 
-REGRAS:
+REGRAS IMPORTANTES:
 - Seja natural, calorosa e direta — como uma atendente humana real
 - Mensagens curtas (máximo 3 parágrafos)
 - Use emojis com moderação (1-2 por mensagem no máximo)
@@ -62,16 +128,17 @@ REGRAS:
 - Se perguntarem algo que não sabe, diga que vai verificar com o time
 - Não force a venda — qualifique primeiro
 - Responda sempre em português brasileiro
+- Se a pessoa já conversou com você antes, retome o contexto naturalmente sem precisar se reapresentar
 
 QUANDO QUALIFICAR O LEAD:
 Considere qualificado quando a pessoa:
 - Confirmar que tem negócio de alimentação
 - Demonstrar interesse em fidelizar clientes
 - Aceitar conversar com o time
-Quando qualificar, inclua exatamente o texto [LEAD_QUALIFICADO] no final da sua resposta (invisível para o usuário).
 
-EXEMPLO DE ABERTURA:
-"Oi! 👋 Aqui é a Sofia, do Fan Fave! Vi que você entrou em contato — tudo bem? Posso te contar rapidinho o que fazemos aqui?"`;
+INSTRUÇÃO TÉCNICA OBRIGATÓRIA:
+Quando o lead estiver qualificado, adicione APENAS ao final da sua resposta, sem espaço antes, o marcador: [LQ]
+Este marcador é INVISÍVEL para o usuário e será removido automaticamente. NUNCA mencione este marcador na conversa.`;
 
 // ─── Z-API ───────────────────────────────────────────────────────────────────
 async function sendWhatsApp(phone, message) {
@@ -79,7 +146,10 @@ async function sendWhatsApp(phone, message) {
     `https://api.z-api.io/instances/${process.env.ZAPI_INSTANCE_ID}/token/${process.env.ZAPI_TOKEN}/send-text`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Client-Token": process.env.ZAPI_CLIENT_TOKEN },
+      headers: {
+        "Content-Type": "application/json",
+        "Client-Token": process.env.ZAPI_CLIENT_TOKEN,
+      },
       body: JSON.stringify({ phone, message }),
     }
   );
@@ -88,28 +158,39 @@ async function sendWhatsApp(phone, message) {
   return data;
 }
 
+// ─── EXTRAIR NOME E ESTABELECIMENTO DO HISTÓRICO ─────────────────────────────
+function extractInfo(history) {
+  const texto = history
+    .filter((m) => m.role === "user")
+    .map((m) => m.content)
+    .join(" ");
+
+  const nomeMatch = texto.match(/\b([A-ZÁÉÍÓÚÃÕÂÊÎÔÛÇ][a-záéíóúãõâêîôûç]+(?:\s[A-ZÁÉÍÓÚÃÕÂÊÎÔÛÇ][a-záéíóúãõâêîôûç]+)?)\b/);
+  const nome = nomeMatch ? nomeMatch[1] : "Lead WhatsApp";
+
+  return { nome };
+}
+
 // ─── SALVAR LEAD ─────────────────────────────────────────────────────────────
 async function saveLead(phone, session) {
-  const summary = session.history.slice(-6)
+  const summary = session.history
+    .slice(-8)
     .map((m) => `${m.role === "user" ? "Lead" : "Sofia"}: ${m.content}`)
     .join("\n");
 
-  const nomeMatch = session.history
-    .filter((m) => m.role === "user")
-    .map((m) => m.content)
-    .join(" ")
-    .match(/\b([A-Z][a-záéíóúãõâêîôûç]+(?:\s[A-Z][a-záéíóúãõâêîôûç]+)?)\b/);
-
-  const nome = nomeMatch ? nomeMatch[1] : "Lead WhatsApp";
+  const { nome } = extractInfo(session.history);
 
   try {
     await db.query(
       `INSERT INTO leads (nome, whatsapp, estabelecimento, tipo, status, origem, notas, data)
        VALUES ($1, $2, $3, $4, $5, $6, $7, NOW())
-       ON CONFLICT (whatsapp) DO UPDATE SET status = EXCLUDED.status, notas = EXCLUDED.notas`,
-      [nome, phone, "Via WhatsApp", "Food service", "novo", "whatsapp", summary]
+       ON CONFLICT (whatsapp) DO UPDATE SET
+         status = CASE WHEN leads.status = 'fechado' THEN leads.status ELSE 'contato' END,
+         notas = EXCLUDED.notas,
+         atualizado = NOW()`,
+      [nome, phone, session.estabelecimento || "Via WhatsApp", "Food service", "novo", "whatsapp", summary]
     );
-    console.log(`✅ Lead salvo: ${phone}`);
+    console.log(`✅ Lead salvo: ${phone} (${nome})`);
   } catch (err) {
     console.error("Erro ao salvar lead:", err.message);
   }
@@ -117,54 +198,99 @@ async function saveLead(phone, session) {
 
 // ─── NOTIFICAR MANAGER ───────────────────────────────────────────────────────
 async function notifyManager(phone, session) {
-  const summary = session.history.slice(-4)
+  const { nome } = extractInfo(session.history);
+  const summary = session.history
+    .slice(-4)
     .map((m) => `${m.role === "user" ? "👤" : "🤖"} ${m.content}`)
     .join("\n");
+
   if (process.env.MANAGER_PHONE) {
-    await sendWhatsApp(
-      process.env.MANAGER_PHONE,
-      `🎯 *Lead qualificado pela Sofia!*\n\n📱 ${phone}\n\n💬 Contexto:\n${summary}\n\n_Veja no CRM._`
-    );
+    const msg = `🎯 *Lead qualificado pela Sofia!*\n\n👤 ${nome}\n📱 ${phone}\n\n💬 Contexto:\n${summary}\n\n_Veja no CRM: fanfave-crm.vercel.app/#crm_`;
+    await sendWhatsApp(process.env.MANAGER_PHONE, msg);
   }
 }
 
-// ─── WEBHOOK WHATSAPP ────────────────────────────────────────────────────────
+// ─── REMOVER MARCADOR DO TEXTO ────────────────────────────────────────────────
+function removeMarker(text) {
+  // Remove qualquer variação do marcador com regex
+  return text
+    .replace(/\[LQ\]/gi, "")
+    .replace(/\[LEAD_QUALIFICADO\]/gi, "")
+    .replace(/\[lead qualificado\]/gi, "")
+    .trim();
+}
+
+function hasMarker(text) {
+  return /\[LQ\]/i.test(text) || /\[LEAD_QUALIFICADO\]/i.test(text);
+}
+
+// ─── WEBHOOK PRINCIPAL ───────────────────────────────────────────────────────
 app.post("/webhook/whatsapp", async (req, res) => {
   res.sendStatus(200);
+
   const body = req.body;
   if (body.fromMe || body.isGroup || body.type !== "ReceivedCallback") return;
 
   const phone = body.phone?.replace(/\D/g, "");
-  const text = body.text?.message || body.audio?.transcription || body.image?.caption || body.document?.caption;
+  const text =
+    body.text?.message ||
+    body.audio?.transcription ||
+    body.image?.caption ||
+    body.document?.caption;
+
   if (!phone || !text) return;
 
-  console.log(`📨 ${phone}: ${text}`);
-  const session = getSession(phone);
+  console.log(`📨 ${phone}: ${text.substring(0, 80)}`);
+
+  const session = await getSession(phone);
+
+  // Se já foi qualificado antes, só responde normalmente sem requalificar
+  const alreadyQualified = session.qualified;
+
   session.history.push({ role: "user", content: text });
-  if (session.history.length > 20) session.history = session.history.slice(-20);
+
+  // Mantém histórico em no máximo 30 mensagens
+  if (session.history.length > 30) session.history = session.history.slice(-30);
 
   try {
+    // Monta contexto para o Claude
+    const systemWithContext = alreadyQualified
+      ? SOFIA_SYSTEM + "\n\nNOTA: Este lead já foi qualificado anteriormente. Continue a conversa naturalmente, focando em ajudar e responder dúvidas."
+      : SOFIA_SYSTEM;
+
     const response = await anthropic.messages.create({
       model: "claude-sonnet-4-6",
       max_tokens: 500,
-      system: SOFIA_SYSTEM,
+      system: systemWithContext,
       messages: session.history,
     });
 
-    let reply = response.content[0].text;
+    const rawReply = response.content[0].text;
 
-    if (reply.includes("[LEAD_QUALIFICADO]") && !session.qualified) {
+    // Remove SEMPRE o marcador antes de enviar — independente de onde apareça
+    const reply = removeMarker(rawReply);
+
+    // Verifica qualificação
+    if (hasMarker(rawReply) && !alreadyQualified) {
       session.qualified = true;
-      reply = reply.replace("[LEAD_QUALIFICADO]", "").trim();
+      console.log(`🎯 Lead qualificado: ${phone}`);
       await saveLead(phone, session);
       await notifyManager(phone, session);
     }
 
+    // Salva histórico sem o marcador
     session.history.push({ role: "assistant", content: reply });
+    session.lastActivity = Date.now();
+
+    // Persiste sessão no banco
+    await saveSession(phone, session);
+
+    // Envia resposta LIMPA para o lead
     await sendWhatsApp(phone, reply);
     console.log(`✅ Sofia respondeu para ${phone}`);
+
   } catch (err) {
-    console.error("Erro:", err.message);
+    console.error("Erro ao processar:", err.message);
   }
 });
 
@@ -172,36 +298,22 @@ app.post("/webhook/whatsapp", async (req, res) => {
 // ─── API DO CRM ─────────────────────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════════════════════
 
-// GET /api/leads — listar todos os leads (com filtros opcionais)
 app.get("/api/leads", async (req, res) => {
   try {
     const { status, origem, search } = req.query;
     let query = "SELECT * FROM leads WHERE 1=1";
     const params = [];
-
-    if (status) {
-      params.push(status);
-      query += ` AND status = $${params.length}`;
-    }
-    if (origem) {
-      params.push(origem);
-      query += ` AND origem = $${params.length}`;
-    }
-    if (search) {
-      params.push(`%${search}%`);
-      query += ` AND (nome ILIKE $${params.length} OR estabelecimento ILIKE $${params.length})`;
-    }
-
+    if (status) { params.push(status); query += ` AND status = $${params.length}`; }
+    if (origem) { params.push(origem); query += ` AND origem = $${params.length}`; }
+    if (search) { params.push(`%${search}%`); query += ` AND (nome ILIKE $${params.length} OR estabelecimento ILIKE $${params.length})`; }
     query += " ORDER BY data DESC";
     const result = await db.query(query, params);
     res.json({ ok: true, leads: result.rows });
   } catch (err) {
-    console.error("GET /api/leads erro:", err.message);
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-// GET /api/leads/:id — buscar lead por ID
 app.get("/api/leads/:id", async (req, res) => {
   try {
     const result = await db.query("SELECT * FROM leads WHERE id = $1", [req.params.id]);
@@ -212,18 +324,14 @@ app.get("/api/leads/:id", async (req, res) => {
   }
 });
 
-// POST /api/leads — criar novo lead
 app.post("/api/leads", async (req, res) => {
   try {
     const { nome, whatsapp, email, estabelecimento, tipo, cidade, status, origem, notas } = req.body;
-    if (!nome || !whatsapp || !estabelecimento) {
-      return res.status(400).json({ ok: false, error: "nome, whatsapp e estabelecimento são obrigatórios" });
-    }
+    if (!nome || !whatsapp || !estabelecimento) return res.status(400).json({ ok: false, error: "nome, whatsapp e estabelecimento são obrigatórios" });
     const result = await db.query(
       `INSERT INTO leads (nome, whatsapp, email, estabelecimento, tipo, cidade, status, origem, notas, data)
        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) RETURNING *`,
-      [nome, whatsapp, email || null, estabelecimento, tipo || "Food service",
-       cidade || "Montes Claros", status || "novo", origem || "manual", notas || null]
+      [nome, whatsapp, email || null, estabelecimento, tipo || "Food service", cidade || "Montes Claros", status || "novo", origem || "manual", notas || null]
     );
     res.status(201).json({ ok: true, lead: result.rows[0] });
   } catch (err) {
@@ -232,21 +340,15 @@ app.post("/api/leads", async (req, res) => {
   }
 });
 
-// PATCH /api/leads/:id — atualizar status e/ou notas
 app.patch("/api/leads/:id", async (req, res) => {
   try {
     const { status, notas, nome, estabelecimento, tipo, cidade, email, origem } = req.body;
     const result = await db.query(
       `UPDATE leads SET
-        status       = COALESCE($1, status),
-        notas        = COALESCE($2, notas),
-        nome         = COALESCE($3, nome),
-        estabelecimento = COALESCE($4, estabelecimento),
-        tipo         = COALESCE($5, tipo),
-        cidade       = COALESCE($6, cidade),
-        email        = COALESCE($7, email),
-        origem       = COALESCE($8, origem),
-        atualizado   = NOW()
+        status = COALESCE($1, status), notas = COALESCE($2, notas),
+        nome = COALESCE($3, nome), estabelecimento = COALESCE($4, estabelecimento),
+        tipo = COALESCE($5, tipo), cidade = COALESCE($6, cidade),
+        email = COALESCE($7, email), origem = COALESCE($8, origem), atualizado = NOW()
        WHERE id = $9 RETURNING *`,
       [status, notas, nome, estabelecimento, tipo, cidade, email, origem, req.params.id]
     );
@@ -257,7 +359,6 @@ app.patch("/api/leads/:id", async (req, res) => {
   }
 });
 
-// DELETE /api/leads/:id — excluir lead
 app.delete("/api/leads/:id", async (req, res) => {
   try {
     const result = await db.query("DELETE FROM leads WHERE id = $1 RETURNING id", [req.params.id]);
@@ -268,7 +369,6 @@ app.delete("/api/leads/:id", async (req, res) => {
   }
 });
 
-// GET /api/stats — estatísticas para o dashboard do CRM
 app.get("/api/stats", async (req, res) => {
   try {
     const [total, porStatus, porOrigem, semana] = await Promise.all([
@@ -277,14 +377,7 @@ app.get("/api/stats", async (req, res) => {
       db.query("SELECT origem, COUNT(*) as count FROM leads GROUP BY origem"),
       db.query("SELECT COUNT(*) as count FROM leads WHERE data >= NOW() - INTERVAL '7 days'"),
     ]);
-
-    res.json({
-      ok: true,
-      total: parseInt(total.rows[0].total),
-      semana: parseInt(semana.rows[0].count),
-      porStatus: porStatus.rows,
-      porOrigem: porOrigem.rows,
-    });
+    res.json({ ok: true, total: parseInt(total.rows[0].total), semana: parseInt(semana.rows[0].count), porStatus: porStatus.rows, porOrigem: porOrigem.rows });
   } catch (err) {
     res.status(500).json({ ok: false, error: err.message });
   }
@@ -319,5 +412,6 @@ app.post("/send", async (req, res) => {
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`🤖 Sofia online na porta ${PORT}`);
-  console.log(`📡 API CRM disponível em /api/leads`);
+  console.log(`📡 Webhook: /webhook/whatsapp`);
+  console.log(`📊 API CRM: /api/leads`);
 });
