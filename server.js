@@ -60,6 +60,12 @@ async function setupDb() {
     await db.query(`ALTER TABLE leads ADD CONSTRAINT leads_status_check CHECK (status IN ('novo','contato','demo','negociacao','fechado','arquivado'))`);
   } catch (_) {}
 
+  // Remove o CHECK constraint antigo da origem e recria com 'diagnostico' incluído
+  try {
+    await db.query(`ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_origem_check`);
+    await db.query(`ALTER TABLE leads ADD CONSTRAINT leads_origem_check CHECK (origem IN ('instagram','landing','whatsapp','indicacao','manual','diagnostico'))`);
+  } catch (_) {}
+
   console.log("✅ Banco configurado");
 }
 
