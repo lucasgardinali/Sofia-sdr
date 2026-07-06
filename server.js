@@ -139,64 +139,108 @@ async function updateLastMessage(phone) {
   }
 }
 
-// ─── PROMPT DA SOFIA ──────────────────────────────────────────────────────────
-const SOFIA_SYSTEM = `Você é Sofia, assistente comercial do Fan Fave — plataforma de fidelização digital para negócios de food service (restaurantes, lanchonetes, bares, cafeterias, padarias, food trucks e similares) em Montes Claros e região.
+// ─── MULTI-TENANT: RESOLUÇÃO E CONTEXTO ──────────────────────────────────────
 
-SEU OBJETIVO: qualificar o lead e agendar uma conversa com o time comercial.
+async function resolveInstance(instanceId) {
+  try {
+    const result = await db.query(
+      `SELECT tenant_id, token, client_token FROM whatsapp_instances WHERE instance_id = $1`,
+      [instanceId]
+    );
+    if (!result.rows.length) return null;
+    const row = result.rows[0];
+    return { tenantId: row.tenant_id, token: row.token, clientToken: row.client_token };
+  } catch (err) {
+    console.error("Erro ao resolver instância:", err.message);
+    return null;
+  }
+}
 
-SOBRE O FAN FAVE:
-- Programa de pontos digital para food service
-- O cliente pontua pelo número do celular — sem QR code, sem app complicado
-- O dono do estabelecimento acessa um painel com todos os dados dos clientes
-- Ativação em até 2 dias com suporte da equipe
-- Plano: R$119,90/mês
-- Funciona para qualquer negócio de alimentação
+async function loadAgentConfig(tenantId) {
+  const result = await db.query(
+    `SELECT persona_prompt, manager_phone, nome_agente FROM agent_config WHERE tenant_id = $1 AND ativo = true`,
+    [tenantId]
+  );
+  if (!result.rows.length) throw new Error(`agent_config não encontrado para tenant ${tenantId}`);
+  return result.rows[0];
+}
 
-SEU FLUXO DE CONVERSA:
-1. Saudação calorosa e apresentação rápida
-2. Perguntar o nome da pessoa
-3. Perguntar qual é o estabelecimento e o segmento
-4. Apresentar brevemente o Fan Fave focando na dor (cliente que não volta)
-5. Perguntar se faz sentido para o negócio deles
-6. Se interesse demonstrado: propor conversa com o time e perguntar melhor horário
-7. Se interesse alto ou reunião agendada: marcar como qualificado
+async function loadOrCreateContact(tenantId, phone) {
+  const result = await db.query(
+    `INSERT INTO contacts (tenant_id, nome, telefone)
+     VALUES ($1, 'Contato WhatsApp', $2)
+     ON CONFLICT (tenant_id, telefone) DO UPDATE SET atualizado_em = NOW()
+     RETURNING id, etapa_funil, nome`,
+    [tenantId, phone]
+  );
+  return result.rows[0];
+}
 
-REGRAS IMPORTANTES:
-- Seja natural, calorosa e direta — como uma atendente humana real
-- Mensagens curtas (máximo 3 parágrafos)
-- Use emojis com moderação (1-2 por mensagem no máximo)
-- Nunca invente funcionalidades que não existem
-- Se perguntarem algo que não sabe, diga que vai verificar com o time
-- Não force a venda — qualifique primeiro
-- Responda sempre em português brasileiro
-- Se a pessoa já conversou com você antes, retome o contexto naturalmente
+async function loadOrCreateConversation(tenantId, contactId) {
+  const existing = await db.query(
+    `SELECT id FROM conversations
+     WHERE tenant_id = $1 AND contact_id = $2 AND status = 'aberta' LIMIT 1`,
+    [tenantId, contactId]
+  );
+  if (existing.rows.length) return existing.rows[0];
+  const created = await db.query(
+    `INSERT INTO conversations (tenant_id, contact_id) VALUES ($1, $2) RETURNING id`,
+    [tenantId, contactId]
+  );
+  return created.rows[0];
+}
 
-MARCADORES TÉCNICOS OBRIGATÓRIOS (invisíveis para o usuário, removidos automaticamente):
+async function loadRecentMessages(conversationId, limit = 30) {
+  const result = await db.query(
+    `SELECT remetente, conteudo FROM messages
+     WHERE conversation_id = $1
+     ORDER BY criado_em ASC`,
+    [conversationId]
+  );
+  return result.rows.slice(-limit).map(row => ({
+    role:    row.remetente === "contato" ? "user" : "assistant",
+    content: row.conteudo,
+  }));
+}
 
-[LQ] — Adicione NO FINAL da resposta quando o lead estiver qualificado:
-  - Confirmou que tem negócio de alimentação E demonstrou interesse claro
-  - Aceitou conversar com o time comercial
-  - Reunião ou conversa foi agendada
+async function saveMessage(tenantId, conversationId, remetente, conteudo) {
+  await db.query(
+    `INSERT INTO messages (tenant_id, conversation_id, remetente, conteudo) VALUES ($1,$2,$3,$4)`,
+    [tenantId, conversationId, remetente, conteudo]
+  );
+  await db.query(
+    `UPDATE conversations SET ultima_mensagem_em = NOW() WHERE id = $1`,
+    [conversationId]
+  );
+}
 
-[DQ] — Adicione NO FINAL da resposta quando o lead for desqualificado:
-  - Disse claramente que não tem interesse
-  - Não tem negócio de alimentação
-  - Pediu para não ser contatado mais
-  - Respondeu de forma muito negativa e definitiva
+async function updateContactEtapaFunil(contactId, etapa, nome = null) {
+  await db.query(
+    `UPDATE contacts SET etapa_funil = $2, nome = COALESCE($3, nome), atualizado_em = NOW() WHERE id = $1`,
+    [contactId, etapa, nome]
+  );
+}
 
-[RA] — Adicione NO FINAL da resposta quando uma reunião for efetivamente agendada:
-  - Data/horário definidos
-  - Ou combinado que o time vai ligar em horário específico
+async function archiveConversation(conversationId) {
+  await db.query(
+    `UPDATE conversations SET status = 'arquivada' WHERE id = $1`,
+    [conversationId]
+  );
+}
 
-NUNCA mencione esses marcadores na conversa. Eles são invisíveis para o usuário.`;
+// SOFIA_SYSTEM removido — prompt mora em agent_config.persona_prompt no banco.
 
 // ─── Z-API ───────────────────────────────────────────────────────────────────
-async function sendWhatsApp(phone, message) {
+// creds = { instanceId, token, clientToken } — se omitido, usa env vars (follow-up job)
+async function sendWhatsApp(phone, message, creds = {}) {
+  const instanceId  = creds.instanceId  || process.env.ZAPI_INSTANCE_ID;
+  const token       = creds.token       || process.env.ZAPI_TOKEN;
+  const clientToken = creds.clientToken || process.env.ZAPI_CLIENT_TOKEN;
   const res = await fetch(
-    `https://api.z-api.io/instances/${process.env.ZAPI_INSTANCE_ID}/token/${process.env.ZAPI_TOKEN}/send-text`,
+    `https://api.z-api.io/instances/${instanceId}/token/${token}/send-text`,
     {
       method: "POST",
-      headers: { "Content-Type": "application/json", "Client-Token": process.env.ZAPI_CLIENT_TOKEN },
+      headers: { "Content-Type": "application/json", "Client-Token": clientToken },
       body: JSON.stringify({ phone, message }),
     }
   );
@@ -220,45 +264,19 @@ function detectMarkers(text) {
   };
 }
 
-// ─── EXTRAIR INFO ─────────────────────────────────────────────────────────────
-function extractInfo(history) {
-  const texto = history.filter((m) => m.role === "user").map((m) => m.content).join(" ");
-  const nomeMatch = texto.match(/\b([A-ZÁÉÍÓÚÃÕÂÊÎÔÛÇ][a-záéíóúãõâêîôûç]+(?:\s[A-ZÁÉÍÓÚÃÕÂÊÎÔÛÇ][a-záéíóúãõâêîôûç]+)?)\b/);
-  return { nome: nomeMatch ? nomeMatch[1] : "Lead WhatsApp" };
-}
-
-// ─── SALVAR LEAD ──────────────────────────────────────────────────────────────
-async function saveLead(phone, session, status = "novo") {
-  const summary = session.history.slice(-8).map((m) => `${m.role === "user" ? "Lead" : "Sofia"}: ${m.content}`).join("\n");
-  const { nome } = extractInfo(session.history);
-  try {
-    await db.query(
-      `INSERT INTO leads (nome, whatsapp, estabelecimento, tipo, status, origem, notas, data)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,NOW())
-       ON CONFLICT (whatsapp) DO UPDATE SET
-         status     = CASE WHEN leads.status = 'fechado' THEN leads.status ELSE EXCLUDED.status END,
-         notas      = EXCLUDED.notas,
-         atualizado = NOW()`,
-      [nome, phone, session.estabelecimento || "Via WhatsApp", "Food service", status, "whatsapp", summary]
-    );
-    console.log(`✅ Lead salvo: ${phone} (${nome}) — status: ${status}`);
-  } catch (err) {
-    console.error("Erro ao salvar lead:", err.message);
-  }
-}
+// extractInfo e saveLead removidos — substituídos por updateContactEtapaFunil.
 
 // ─── NOTIFICAR MANAGER ────────────────────────────────────────────────────────
-async function notifyManager(phone, session, tipo = "qualificado") {
-  const { nome } = extractInfo(session.history);
-  const summary = session.history.slice(-4).map((m) => `${m.role === "user" ? "👤" : "🤖"} ${m.content}`).join("\n");
+async function notifyManager(phone, contactNome, recentMessages, tipo, managerPhone, creds) {
+  if (!managerPhone) return;
+  const summary = recentMessages.slice(-4).map((m) => `${m.role === "user" ? "👤" : "🤖"} ${m.content}`).join("\n");
   const emojis = { qualificado: "🎯", reuniao: "📅", desqualificado: "❌" };
-  const labels = { qualificado: "Lead qualificado pela Sofia!", reuniao: "Reunião agendada pela Sofia!", desqualificado: "Lead desqualificado" };
-  if (process.env.MANAGER_PHONE) {
-    await sendWhatsApp(
-      process.env.MANAGER_PHONE,
-      `${emojis[tipo]} *${labels[tipo]}*\n\n👤 ${nome}\n📱 ${phone}\n\n💬 Contexto:\n${summary}\n\n_Veja no CRM: fanfave-crm.vercel.app/#crm_`
-    );
-  }
+  const labels = { qualificado: "Lead qualificado!", reuniao: "Reunião agendada!", desqualificado: "Lead desqualificado" };
+  await sendWhatsApp(
+    managerPhone,
+    `${emojis[tipo]} *${labels[tipo]}*\n\n👤 ${contactNome}\n📱 ${phone}\n\n💬 Contexto:\n${summary}\n\n_Veja no CRM: fanfave-crm.vercel.app/#crm_`,
+    creds
+  );
 }
 
 // ─── FOLLOW-UP ────────────────────────────────────────────────────────────────
@@ -367,32 +385,43 @@ app.post("/webhook/whatsapp", async (req, res) => {
   const text  = body.text?.message || body.audio?.transcription || body.image?.caption || body.document?.caption;
   if (!phone || !text) return;
 
-  console.log(`📨 ${phone}: ${text.substring(0, 80)}`);
-
-  const session = await getSession(phone);
-
-  // Se lead já foi desqualificado ou encerrado, não responde
-  if (session.followupStatus === "desqualificado") {
-    console.log(`⏭️ Lead desqualificado — ignorando: ${phone}`);
+  // Resolve tenant a partir da instância Z-API que recebeu a mensagem
+  const instance = await resolveInstance(body.instanceId);
+  if (!instance) {
+    console.warn(`⚠️ Instância desconhecida: ${body.instanceId}`);
     return;
   }
+  const { tenantId, token, clientToken } = instance;
+  const creds = { instanceId: body.instanceId, token, clientToken };
 
-  // Atualiza timestamp e reseta flags de follow-up (lead voltou a responder)
-  await updateLastMessage(phone);
-
-  session.history.push({ role: "user", content: text });
-  if (session.history.length > 30) session.history = session.history.slice(-30);
+  console.log(`📨 [${tenantId}] ${phone}: ${text.substring(0, 80)}`);
 
   try {
-    const systemWithContext = session.followupStatus === "reuniao_agendada"
-      ? SOFIA_SYSTEM + "\n\nNOTA: Este lead já tem reunião agendada. Confirme detalhes e seja prestativa. NÃO use [LQ] ou [RA] novamente."
-      : SOFIA_SYSTEM;
+    const [agentConfig, contact] = await Promise.all([
+      loadAgentConfig(tenantId),
+      loadOrCreateContact(tenantId, phone),
+    ]);
+
+    if (contact.etapa_funil === "desqualificado") {
+      console.log(`⏭️ Lead desqualificado — ignorando: ${phone}`);
+      return;
+    }
+
+    const conversation = await loadOrCreateConversation(tenantId, contact.id);
+
+    await saveMessage(tenantId, conversation.id, "contato", text);
+
+    const history = await loadRecentMessages(conversation.id);
+
+    const systemWithContext = contact.etapa_funil === "demo"
+      ? agentConfig.persona_prompt + "\n\nNOTA: Este lead já tem reunião agendada. Confirme detalhes e seja prestativa. NÃO use [LQ] ou [RA] novamente."
+      : agentConfig.persona_prompt;
 
     const response = await anthropic.messages.create({
-      model: "claude-sonnet-4-6",
+      model:      "claude-sonnet-4-6",
       max_tokens: 500,
-      system: systemWithContext,
-      messages: session.history,
+      system:     systemWithContext,
+      messages:   history,
     });
 
     const rawReply = response.content[0].text;
@@ -400,34 +429,27 @@ app.post("/webhook/whatsapp", async (req, res) => {
     const markers  = detectMarkers(rawReply);
 
     // ── Processa marcadores ──
-    if (markers.reuniaoAgendada && session.followupStatus !== "reuniao_agendada") {
-      session.followupStatus = "reuniao_agendada";
-      session.qualified      = true;
+    if (markers.reuniaoAgendada && contact.etapa_funil !== "demo") {
       console.log(`📅 Reunião agendada: ${phone}`);
-      await saveLead(phone, session, "demo");
-      await notifyManager(phone, session, "reuniao");
-    } else if (markers.qualificado && !session.qualified) {
-      session.qualified      = true;
-      session.followupStatus = "qualificado";
+      await updateContactEtapaFunil(contact.id, "demo");
+      await notifyManager(phone, contact.nome, history, "reuniao", agentConfig.manager_phone, creds);
+    } else if (markers.qualificado && contact.etapa_funil === "novo_lead") {
       console.log(`🎯 Lead qualificado: ${phone}`);
-      await saveLead(phone, session, "contato");
-      await notifyManager(phone, session, "qualificado");
+      await updateContactEtapaFunil(contact.id, "em_contato");
+      await notifyManager(phone, contact.nome, history, "qualificado", agentConfig.manager_phone, creds);
     } else if (markers.desqualificado) {
-      session.followupStatus = "desqualificado";
       console.log(`❌ Lead desqualificado: ${phone}`);
-      await saveLead(phone, session, "novo");
-      await notifyManager(phone, session, "desqualificado");
+      await updateContactEtapaFunil(contact.id, "desqualificado");
+      await archiveConversation(conversation.id);
+      await notifyManager(phone, contact.nome, history, "desqualificado", agentConfig.manager_phone, creds);
     }
 
-    session.history.push({ role: "assistant", content: reply });
-    session.lastActivity = Date.now();
-
-    await saveSession(phone, session);
-    await sendWhatsApp(phone, reply);
-    console.log(`✅ Sofia respondeu → ${phone} [status: ${session.followupStatus}]`);
+    await saveMessage(tenantId, conversation.id, "agente_ia", reply);
+    await sendWhatsApp(phone, reply, creds);
+    console.log(`✅ ${agentConfig.nome_agente} respondeu → ${phone} [etapa: ${contact.etapa_funil}]`);
 
   } catch (err) {
-    console.error("Erro:", err.message);
+    console.error("Erro no webhook:", err.message);
   }
 });
 
