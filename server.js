@@ -13,60 +13,134 @@ app.use(express.json());
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const db = new pg.Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false } });
 
-// ─── SESSÕES EM MEMÓRIA ───────────────────────────────────────────────────────
-const sessions = new Map();
-const SESSION_TTL = 30 * 60 * 1000;
-
-setInterval(() => {
-  const now = Date.now();
-  for (const [phone, session] of sessions.entries()) {
-    if (now - session.lastActivity > SESSION_TTL) sessions.delete(phone);
-  }
-}, 10 * 60 * 1000);
-
 // ─── SETUP DO BANCO ───────────────────────────────────────────────────────────
+// Idempotente: cria o schema multi-tenant (ver schema-multi-tenant.sql) se ainda
+// não existir. Tabelas legadas (leads, sofia_sessions) não são mais geridas aqui
+// — o app roda inteiramente sobre tenants/contacts/conversations/messages.
 async function setupDb() {
-  await db.query(`
-    CREATE TABLE IF NOT EXISTS sofia_sessions (
-      phone              TEXT PRIMARY KEY,
-      history            JSONB    DEFAULT '[]',
-      qualified          BOOLEAN  DEFAULT false,
-      nome               TEXT,
-      estabelecimento    TEXT,
-      followup_status    TEXT     DEFAULT 'ativo',
-      last_message_at    TIMESTAMPTZ DEFAULT NOW(),
-      followup_1h        BOOLEAN  DEFAULT false,
-      followup_24h       BOOLEAN  DEFAULT false,
-      followup_7d        BOOLEAN  DEFAULT false,
-      updated_at         TIMESTAMPTZ DEFAULT NOW()
-    )
-  `);
-
-  // Garante colunas caso tabela já exista de versão anterior
-  const cols = [
-    `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS followup_status TEXT DEFAULT 'ativo'`,
-    `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS last_message_at TIMESTAMPTZ DEFAULT NOW()`,
-    `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS followup_1h BOOLEAN DEFAULT false`,
-    `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS followup_24h BOOLEAN DEFAULT false`,
-    `ALTER TABLE sofia_sessions ADD COLUMN IF NOT EXISTS followup_7d BOOLEAN DEFAULT false`,
-    `ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao TIMESTAMPTZ`,
-    `ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao_desc TEXT`,
+  const statements = [
+    `CREATE TABLE IF NOT EXISTS tenants (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      nome            VARCHAR(150) NOT NULL,
+      slug            VARCHAR(60)  UNIQUE NOT NULL,
+      segmento        VARCHAR(50)  NOT NULL,
+      plano           VARCHAR(30)  DEFAULT 'piloto',
+      status          VARCHAR(20)  DEFAULT 'ativo',
+      criado_em       TIMESTAMPTZ  DEFAULT now(),
+      atualizado_em   TIMESTAMPTZ  DEFAULT now()
+    )`,
+    `CREATE TABLE IF NOT EXISTS segment_templates (
+      id                         UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      segmento                   VARCHAR(50)  UNIQUE NOT NULL,
+      nome_exibicao              VARCHAR(100) NOT NULL,
+      campos_customizados_schema JSONB        NOT NULL DEFAULT '[]',
+      modulos_padrao             JSONB        NOT NULL DEFAULT '[]',
+      persona_prompt_base        TEXT,
+      site_template_id           VARCHAR(50),
+      criado_em                  TIMESTAMPTZ  DEFAULT now()
+    )`,
+    `CREATE TABLE IF NOT EXISTS users (
+      id                   UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id            UUID         REFERENCES tenants(id),
+      nome                 VARCHAR(150) NOT NULL,
+      email                VARCHAR(150) UNIQUE NOT NULL,
+      senha_hash           VARCHAR(255) NOT NULL,
+      role                 VARCHAR(20)  NOT NULL DEFAULT 'atendente',
+      ativo                BOOLEAN      DEFAULT true,
+      precisa_trocar_senha BOOLEAN      DEFAULT true,
+      criado_em            TIMESTAMPTZ  DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_users_tenant ON users(tenant_id)`,
+    `CREATE TABLE IF NOT EXISTS agent_config (
+      tenant_id      UUID PRIMARY KEY REFERENCES tenants(id),
+      nome_agente    VARCHAR(50)  NOT NULL,
+      tom_de_voz     VARCHAR(50)  DEFAULT 'amigavel',
+      persona_prompt TEXT         NOT NULL,
+      manager_phone  VARCHAR(20),
+      ativo          BOOLEAN      DEFAULT true,
+      atualizado_em  TIMESTAMPTZ  DEFAULT now()
+    )`,
+    `CREATE TABLE IF NOT EXISTS whatsapp_instances (
+      id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id    UUID         NOT NULL REFERENCES tenants(id),
+      instance_id  VARCHAR(100) NOT NULL,
+      token        VARCHAR(255) NOT NULL,
+      client_token VARCHAR(255) NOT NULL,
+      numero       VARCHAR(20),
+      status       VARCHAR(20)  DEFAULT 'pendente',
+      conectado_em TIMESTAMPTZ,
+      criado_em    TIMESTAMPTZ  DEFAULT now()
+    )`,
+    `CREATE INDEX        IF NOT EXISTS idx_whatsapp_tenant      ON whatsapp_instances(tenant_id)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_instance_id ON whatsapp_instances(instance_id)`,
+    `CREATE TABLE IF NOT EXISTS tenant_modules (
+      tenant_id  UUID        NOT NULL REFERENCES tenants(id),
+      modulo_key VARCHAR(50) NOT NULL,
+      ativo      BOOLEAN     DEFAULT true,
+      config     JSONB       DEFAULT '{}',
+      PRIMARY KEY (tenant_id, modulo_key)
+    )`,
+    `CREATE TABLE IF NOT EXISTS contacts (
+      id                  UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id           UUID         NOT NULL REFERENCES tenants(id),
+      nome                VARCHAR(150) NOT NULL,
+      telefone            VARCHAR(20)  NOT NULL,
+      email               VARCHAR(150),
+      etapa_funil         VARCHAR(50)  DEFAULT 'novo_lead',
+      campos_customizados JSONB        DEFAULT '{}',
+      atendente_id        UUID         REFERENCES users(id),
+      criado_em           TIMESTAMPTZ  DEFAULT now(),
+      atualizado_em       TIMESTAMPTZ  DEFAULT now()
+    )`,
+    `CREATE INDEX        IF NOT EXISTS idx_contacts_tenant        ON contacts(tenant_id)`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_contacts_telefone      ON contacts(tenant_id, telefone)`,
+    `CREATE INDEX        IF NOT EXISTS idx_contacts_custom_fields ON contacts USING GIN (campos_customizados)`,
+    `CREATE TABLE IF NOT EXISTS conversations (
+      id                 UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id          UUID        NOT NULL REFERENCES tenants(id),
+      contact_id         UUID        NOT NULL REFERENCES contacts(id),
+      status             VARCHAR(20) DEFAULT 'aberta',
+      ultima_mensagem_em TIMESTAMPTZ DEFAULT now(),
+      criado_em          TIMESTAMPTZ DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_conversations_tenant ON conversations(tenant_id)`,
+    // Flags de follow-up por conversa — substituem sofia_sessions.followup_1h/24h/7d
+    `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS followup_1h  BOOLEAN DEFAULT false`,
+    `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS followup_24h BOOLEAN DEFAULT false`,
+    `ALTER TABLE conversations ADD COLUMN IF NOT EXISTS followup_7d  BOOLEAN DEFAULT false`,
+    `CREATE TABLE IF NOT EXISTS messages (
+      id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id       UUID        NOT NULL REFERENCES tenants(id),
+      conversation_id UUID        NOT NULL REFERENCES conversations(id),
+      remetente       VARCHAR(20) NOT NULL,
+      conteudo        TEXT        NOT NULL,
+      criado_em       TIMESTAMPTZ DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_messages_conversation ON messages(conversation_id)`,
+    `CREATE TABLE IF NOT EXISTS follow_ups (
+      id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+      tenant_id     UUID        NOT NULL REFERENCES tenants(id),
+      contact_id    UUID        NOT NULL REFERENCES contacts(id),
+      tipo          VARCHAR(50) NOT NULL,
+      data_prevista DATE        NOT NULL,
+      status        VARCHAR(20) DEFAULT 'pendente',
+      criado_em     TIMESTAMPTZ DEFAULT now()
+    )`,
+    `CREATE INDEX IF NOT EXISTS idx_followups_tenant_data ON follow_ups(tenant_id, data_prevista)`,
+    `CREATE TABLE IF NOT EXISTS sites (
+      tenant_id       UUID PRIMARY KEY REFERENCES tenants(id),
+      subdominio      VARCHAR(60)  UNIQUE,
+      dominio_proprio VARCHAR(150),
+      cor_primaria    VARCHAR(7)   DEFAULT '#FF6B4A',
+      cor_secundaria  VARCHAR(7)   DEFAULT '#2EC4B6',
+      logo_url        TEXT,
+      conteudo        JSONB        DEFAULT '{}',
+      publicado       BOOLEAN      DEFAULT false,
+      atualizado_em   TIMESTAMPTZ  DEFAULT now()
+    )`,
   ];
-  for (const col of cols) {
-    try { await db.query(col); } catch (_) {}
-  }
 
-  // Remove o CHECK constraint antigo do status e recria com 'arquivado' incluído
-  try {
-    await db.query(`ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_status_check`);
-    await db.query(`ALTER TABLE leads ADD CONSTRAINT leads_status_check CHECK (status IN ('novo','contato','demo','negociacao','fechado','arquivado'))`);
-  } catch (_) {}
-
-  // Remove o CHECK constraint antigo da origem e recria com 'diagnostico' incluído
-  try {
-    await db.query(`ALTER TABLE leads DROP CONSTRAINT IF EXISTS leads_origem_check`);
-    await db.query(`ALTER TABLE leads ADD CONSTRAINT leads_origem_check CHECK (origem IN ('instagram','landing','whatsapp','indicacao','manual','diagnostico'))`);
-  } catch (_) {}
+  for (const sql of statements) await db.query(sql);
 
   console.log("✅ Banco configurado");
 }
@@ -130,76 +204,6 @@ function resolveTenantId(req) {
     return tid;
   }
   return req.user.tenantId;
-}
-
-// ─── SESSÃO ───────────────────────────────────────────────────────────────────
-async function loadSession(phone) {
-  try {
-    const result = await db.query("SELECT * FROM sofia_sessions WHERE phone = $1", [phone]);
-    if (result.rows.length > 0) {
-      const row = result.rows[0];
-      return {
-        history:         row.history || [],
-        qualified:       row.qualified || false,
-        nome:            row.nome || null,
-        estabelecimento: row.estabelecimento || null,
-        followupStatus:  row.followup_status || "ativo",
-        lastActivity:    Date.now(),
-        fromDb:          true,
-      };
-    }
-  } catch (err) {
-    console.error("Erro ao carregar sessão:", err.message);
-  }
-  return { history: [], qualified: false, nome: null, estabelecimento: null, followupStatus: "ativo", lastActivity: Date.now(), fromDb: false };
-}
-
-async function saveSession(phone, session) {
-  try {
-    await db.query(
-      `INSERT INTO sofia_sessions (phone, history, qualified, nome, estabelecimento, followup_status, last_message_at, updated_at)
-       VALUES ($1,$2,$3,$4,$5,$6,NOW(),NOW())
-       ON CONFLICT (phone) DO UPDATE SET
-         history          = $2,
-         qualified        = $3,
-         nome             = $4,
-         estabelecimento  = $5,
-         followup_status  = $6,
-         updated_at       = NOW()`,
-      [phone, JSON.stringify(session.history), session.qualified,
-       session.nome || null, session.estabelecimento || null,
-       session.followupStatus || "ativo"]
-    );
-  } catch (err) {
-    console.error("Erro ao salvar sessão:", err.message);
-  }
-}
-
-async function getSession(phone) {
-  if (sessions.has(phone)) {
-    const s = sessions.get(phone);
-    s.lastActivity = Date.now();
-    return s;
-  }
-  const s = await loadSession(phone);
-  sessions.set(phone, s);
-  return s;
-}
-
-async function updateLastMessage(phone) {
-  try {
-    await db.query(
-      `UPDATE sofia_sessions
-       SET last_message_at = NOW(),
-           followup_1h  = false,
-           followup_24h = false,
-           followup_7d  = false
-       WHERE phone = $1`,
-      [phone]
-    );
-  } catch (err) {
-    console.error("Erro ao atualizar last_message_at:", err.message);
-  }
 }
 
 // ─── MULTI-TENANT: RESOLUÇÃO E CONTEXTO ──────────────────────────────────────
@@ -291,10 +295,19 @@ async function archiveConversation(conversationId) {
   );
 }
 
+// Chamado quando o contato manda uma nova mensagem, para que o job de
+// follow-up volte a poder disparar (1h/24h/7d) caso ele fique em silêncio de novo.
+async function resetFollowupFlags(conversationId) {
+  await db.query(
+    `UPDATE conversations SET followup_1h = false, followup_24h = false, followup_7d = false WHERE id = $1`,
+    [conversationId]
+  );
+}
+
 // SOFIA_SYSTEM removido — prompt mora em agent_config.persona_prompt no banco.
 
 // ─── Z-API ───────────────────────────────────────────────────────────────────
-// creds = { instanceId, token, clientToken } — se omitido, usa env vars (follow-up job)
+// creds = { instanceId, token, clientToken } — se omitido, usa env vars (usado por /send)
 async function sendWhatsApp(phone, message, creds = {}) {
   const instanceId  = creds.instanceId  || process.env.ZAPI_INSTANCE_ID;
   const token       = creds.token       || process.env.ZAPI_TOKEN;
@@ -343,13 +356,11 @@ async function notifyManager(phone, contactNome, recentMessages, tipo, managerPh
 }
 
 // ─── FOLLOW-UP ────────────────────────────────────────────────────────────────
-async function generateFollowUp(phone, session, tipo) {
-  const contexto = session.history.slice(-6).map((m) => `${m.role === "user" ? "Lead" : "Sofia"}: ${m.content}`).join("\n");
-
+async function generateFollowUp(nomeAgente, contexto, tipo) {
   const prompts = {
-    "1h":  `Você é Sofia do Fan Fave. O lead parou de responder há 1 hora. Com base na conversa abaixo, escreva UMA mensagem curta e calorosa verificando se a pessoa ainda está por aí. Seja leve, não pressione. Máximo 2 linhas. NÃO use marcadores técnicos.\n\nConversa:\n${contexto}`,
-    "24h": `Você é Sofia do Fan Fave. O lead parou de responder há mais de 24 horas. Com base na conversa abaixo, escreva UMA mensagem para retomar o contato. Relembre brevemente o valor do Fan Fave e convide para continuar. Tom amigável, sem pressão. Máximo 3 linhas. NÃO use marcadores técnicos.\n\nConversa:\n${contexto}`,
-    "7d":  `Você é Sofia do Fan Fave. O lead parou de responder há 7 dias. Com base na conversa abaixo, escreva UMA mensagem direta e objetiva de última tentativa. Mencione que ainda tem interesse em ajudar e deixe uma abertura clara. Máximo 3 linhas. NÃO use marcadores técnicos.\n\nConversa:\n${contexto}`,
+    "1h":  `Você é ${nomeAgente}. O lead parou de responder há 1 hora. Com base na conversa abaixo, escreva UMA mensagem curta e calorosa verificando se a pessoa ainda está por aí. Seja leve, não pressione. Máximo 2 linhas. NÃO use marcadores técnicos.\n\nConversa:\n${contexto}`,
+    "24h": `Você é ${nomeAgente}. O lead parou de responder há mais de 24 horas. Com base na conversa abaixo, escreva UMA mensagem para retomar o contato. Relembre brevemente o valor do produto e convide para continuar. Tom amigável, sem pressão. Máximo 3 linhas. NÃO use marcadores técnicos.\n\nConversa:\n${contexto}`,
+    "7d":  `Você é ${nomeAgente}. O lead parou de responder há 7 dias. Com base na conversa abaixo, escreva UMA mensagem direta e objetiva de última tentativa. Mencione que ainda tem interesse em ajudar e deixe uma abertura clara. Máximo 3 linhas. NÃO use marcadores técnicos.\n\nConversa:\n${contexto}`,
   };
 
   try {
@@ -365,71 +376,85 @@ async function generateFollowUp(phone, session, tipo) {
   }
 }
 
-// Job roda a cada 15 minutos
+async function findWhatsAppCreds(tenantId) {
+  const r = await db.query(
+    `SELECT instance_id, token, client_token FROM whatsapp_instances WHERE tenant_id = $1 LIMIT 1`,
+    [tenantId]
+  );
+  if (!r.rows.length) return null;
+  return { instanceId: r.rows[0].instance_id, token: r.rows[0].token, clientToken: r.rows[0].client_token };
+}
+
+// Job roda a cada 15 minutos. Considera "silêncio" o tempo desde a última
+// mensagem do CONTATO (remetente = 'contato'), não desde a última mensagem
+// enviada (que inclui as respostas automáticas da Sofia e os próprios follow-ups).
 async function runFollowUpJob() {
   console.log("⏰ Rodando job de follow-up...");
   try {
     const result = await db.query(`
-      SELECT phone, history, nome, followup_1h, followup_24h, followup_7d, last_message_at, followup_status
-      FROM sofia_sessions
-      WHERE followup_status = 'ativo'
-        AND jsonb_array_length(history) > 0
-        AND last_message_at IS NOT NULL
-        AND last_message_at < NOW() - INTERVAL '55 minutes'
+      SELECT
+        c.id AS conversation_id, c.tenant_id, c.followup_1h, c.followup_24h, c.followup_7d,
+        ct.telefone, ct.nome,
+        lm.criado_em AS last_contato_em
+      FROM conversations c
+      JOIN contacts ct ON ct.id = c.contact_id
+      JOIN LATERAL (
+        SELECT criado_em FROM messages
+        WHERE conversation_id = c.id AND remetente = 'contato'
+        ORDER BY criado_em DESC LIMIT 1
+      ) lm ON true
+      WHERE c.status = 'aberta'
+        AND NOT (c.followup_1h AND c.followup_24h AND c.followup_7d)
+        AND lm.criado_em < NOW() - INTERVAL '55 minutes'
     `);
 
     const now = new Date();
+    const agentConfigCache = new Map();
+    const credsCache = new Map();
 
     for (const row of result.rows) {
-      const phone = row.phone;
-      const session = { history: row.history || [], nome: row.nome, qualified: false };
-      const lastMsg = new Date(row.last_message_at);
-      const diffMs = now - lastMsg;
-      const diffHours = diffMs / (1000 * 60 * 60);
-      const diffDays = diffHours / 24;
+      const diffHours = (now - new Date(row.last_contato_em)) / (1000 * 60 * 60);
+      const diffDays  = diffHours / 24;
 
-      // 1 hora
-      if (diffHours >= 1 && diffHours < 24 && !row.followup_1h) {
-        console.log(`📩 Follow-up 1h → ${phone}`);
-        const msg = await generateFollowUp(phone, session, "1h");
-        if (msg) {
-          await sendWhatsApp(phone, msg);
-          await db.query(`UPDATE sofia_sessions SET followup_1h = true WHERE phone = $1`, [phone]);
-          const s = await getSession(phone);
-          s.history.push({ role: "assistant", content: msg });
-          await saveSession(phone, s);
-        }
+      // No máximo um envio por execução — prioriza o nível mais atrasado
+      // ainda não enviado (evita disparar 1h + 24h juntos se o job ficou parado).
+      let tipo = null;
+      if (diffDays >= 7 && !row.followup_7d) tipo = "7d";
+      else if (diffDays >= 1 && !row.followup_24h) tipo = "24h";
+      else if (diffHours >= 1 && !row.followup_1h) tipo = "1h";
+      if (!tipo) continue;
+
+      if (!agentConfigCache.has(row.tenant_id)) {
+        agentConfigCache.set(row.tenant_id, await loadAgentConfig(row.tenant_id).catch(() => null));
       }
+      const agentConfig = agentConfigCache.get(row.tenant_id);
+      if (!agentConfig) continue;
 
-      // 24 horas
-      if (diffDays >= 1 && diffDays < 7 && !row.followup_24h) {
-        console.log(`📩 Follow-up 24h → ${phone}`);
-        const msg = await generateFollowUp(phone, session, "24h");
-        if (msg) {
-          await sendWhatsApp(phone, msg);
-          await db.query(`UPDATE sofia_sessions SET followup_24h = true WHERE phone = $1`, [phone]);
-          const s = await getSession(phone);
-          s.history.push({ role: "assistant", content: msg });
-          await saveSession(phone, s);
-        }
+      if (!credsCache.has(row.tenant_id)) {
+        credsCache.set(row.tenant_id, await findWhatsAppCreds(row.tenant_id));
       }
+      const creds = credsCache.get(row.tenant_id);
+      if (!creds) continue;
 
-      // 7 dias
-      if (diffDays >= 7 && !row.followup_7d) {
-        console.log(`📩 Follow-up 7d → ${phone}`);
-        const msg = await generateFollowUp(phone, session, "7d");
-        if (msg) {
-          await sendWhatsApp(phone, msg);
-          await db.query(`UPDATE sofia_sessions SET followup_7d = true, followup_status = 'encerrado' WHERE phone = $1`, [phone]);
-          const s = await getSession(phone);
-          s.history.push({ role: "assistant", content: msg });
-          s.followupStatus = "encerrado";
-          await saveSession(phone, s);
-        }
+      const historico = await loadRecentMessages(row.conversation_id, 6);
+      const contexto = historico.map((m) => `${m.role === "user" ? "Lead" : agentConfig.nome_agente}: ${m.content}`).join("\n");
+
+      console.log(`📩 Follow-up ${tipo} → ${row.telefone} [tenant ${row.tenant_id}]`);
+      const msg = await generateFollowUp(agentConfig.nome_agente, contexto, tipo);
+      if (!msg) continue;
+
+      await sendWhatsApp(row.telefone, msg, creds);
+      await saveMessage(row.tenant_id, row.conversation_id, "agente_ia", msg);
+
+      if (tipo === "1h")  await db.query(`UPDATE conversations SET followup_1h  = true WHERE id = $1`, [row.conversation_id]);
+      if (tipo === "24h") await db.query(`UPDATE conversations SET followup_24h = true WHERE id = $1`, [row.conversation_id]);
+      if (tipo === "7d") {
+        await db.query(`UPDATE conversations SET followup_7d = true WHERE id = $1`, [row.conversation_id]);
+        await archiveConversation(row.conversation_id);
       }
     }
 
-    console.log(`✅ Job concluído — ${result.rows.length} sessões verificadas`);
+    console.log(`✅ Job concluído — ${result.rows.length} conversas verificadas`);
   } catch (err) {
     console.error("Erro no job de follow-up:", err.message);
   }
@@ -473,6 +498,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     const conversation = await loadOrCreateConversation(tenantId, contact.id);
 
     await saveMessage(tenantId, conversation.id, "contato", text);
+    await resetFollowupFlags(conversation.id);
 
     const history = await loadRecentMessages(conversation.id);
 
@@ -694,14 +720,6 @@ app.get("/api/stats", auth("super_admin", "tenant_admin"), async (req, res) => {
 // ─── UTILITÁRIOS ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({ status: "ok", service: "Sofia Fan Fave", timestamp: new Date().toISOString() }));
 
-app.get("/sessions", auth("super_admin"), (req, res) => {
-  const list = [];
-  for (const [phone, s] of sessions.entries()) {
-    list.push({ phone, messages: s.history.length, qualified: s.qualified, followupStatus: s.followupStatus, lastActivity: new Date(s.lastActivity).toISOString() });
-  }
-  res.json({ total: list.length, sessions: list });
-});
-
 app.post("/send", auth("super_admin"), async (req, res) => {
   const { phone, message } = req.body;
   if (!phone || !message) return res.status(400).json({ error: "phone e message são obrigatórios" });
@@ -715,6 +733,6 @@ app.listen(PORT, async () => {
   await setupDb();
   console.log(`🤖 Sofia online na porta ${PORT}`);
   console.log(`📡 Webhook: /webhook/whatsapp`);
-  console.log(`📊 API CRM: /api/leads`);
+  console.log(`📊 API CRM: /api/contacts`);
   console.log(`⏰ Follow-up job: a cada 15 minutos`);
 });
