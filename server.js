@@ -2,6 +2,8 @@ import express from "express";
 import cors from "cors";
 import pg from "pg";
 import Anthropic from "@anthropic-ai/sdk";
+import jwt from "jsonwebtoken";
+import bcrypt from "bcryptjs";
 
 const app = express();
 app.use(cors());
@@ -67,6 +69,67 @@ async function setupDb() {
   } catch (_) {}
 
   console.log("✅ Banco configurado");
+}
+
+// ─── AUTENTICAÇÃO ─────────────────────────────────────────────────────────────
+
+// Middleware completo: verifica JWT, ativo, precisa_trocar_senha e role.
+function auth(...roles) {
+  return async (req, res, next) => {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return res.status(401).json({ ok: false, error: "Token não fornecido" });
+    let payload;
+    try { payload = jwt.verify(token, process.env.JWT_SECRET); }
+    catch { return res.status(401).json({ ok: false, error: "Token inválido ou expirado" }); }
+    try {
+      const r = await db.query(
+        "SELECT id, tenant_id, role, ativo, precisa_trocar_senha FROM users WHERE id = $1",
+        [payload.sub]
+      );
+      if (!r.rows.length || !r.rows[0].ativo)
+        return res.status(401).json({ ok: false, error: "Usuário inativo ou não encontrado" });
+      const u = r.rows[0];
+      if (u.precisa_trocar_senha)
+        return res.status(403).json({ ok: false, error: "troca_senha_obrigatoria" });
+      if (roles.length && !roles.includes(u.role))
+        return res.status(403).json({ ok: false, error: "Sem permissão" });
+      req.user = { id: u.id, tenantId: u.tenant_id, role: u.role };
+      next();
+    } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+  };
+}
+
+// Middleware leve: só verifica JWT e ativo. Usado em /auth/trocar-senha,
+// que deve ser acessível mesmo com precisa_trocar_senha = true.
+function authLight() {
+  return async (req, res, next) => {
+    const token = req.headers.authorization?.split(" ")[1];
+    if (!token) return res.status(401).json({ ok: false, error: "Token não fornecido" });
+    let payload;
+    try { payload = jwt.verify(token, process.env.JWT_SECRET); }
+    catch { return res.status(401).json({ ok: false, error: "Token inválido ou expirado" }); }
+    try {
+      const r = await db.query(
+        "SELECT id, tenant_id, role, ativo FROM users WHERE id = $1",
+        [payload.sub]
+      );
+      if (!r.rows.length || !r.rows[0].ativo)
+        return res.status(401).json({ ok: false, error: "Usuário inativo ou não encontrado" });
+      const u = r.rows[0];
+      req.user = { id: u.id, tenantId: u.tenant_id, role: u.role };
+      next();
+    } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+  };
+}
+
+// Retorna o tenantId correto para a query: para super_admin, exige ?tenant_id= na querystring.
+function resolveTenantId(req) {
+  if (req.user.role === "super_admin") {
+    const tid = req.query.tenant_id || req.body?.tenant_id;
+    if (!tid) throw new Error("tenant_id obrigatório para super_admin");
+    return tid;
+  }
+  return req.user.tenantId;
 }
 
 // ─── SESSÃO ───────────────────────────────────────────────────────────────────
@@ -454,92 +517,184 @@ app.post("/webhook/whatsapp", async (req, res) => {
 });
 
 // ════════════════════════════════════════════════════════════════════════════
-// ─── API DO CRM ─────────────────────────────────────────────────────────────
+// ─── AUTH ───────────────────────────────────────────────────────────────────
 // ════════════════════════════════════════════════════════════════════════════
 
-app.get("/api/leads", async (req, res) => {
+app.post("/auth/login", async (req, res) => {
   try {
-    const { status, origem, search } = req.query;
-    let query = "SELECT * FROM leads WHERE 1=1";
-    const params = [];
-    if (status) { params.push(status); query += ` AND status = $${params.length}`; }
-    if (origem) { params.push(origem); query += ` AND origem = $${params.length}`; }
-    if (search) { params.push(`%${search}%`); query += ` AND (nome ILIKE $${params.length} OR estabelecimento ILIKE $${params.length})`; }
-    query += " ORDER BY data DESC";
-    const result = await db.query(query, params);
-    res.json({ ok: true, leads: result.rows });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
-});
-
-app.get("/api/leads/:id", async (req, res) => {
-  try {
-    const result = await db.query("SELECT * FROM leads WHERE id = $1", [req.params.id]);
-    if (!result.rows.length) return res.status(404).json({ ok: false, error: "Lead não encontrado" });
-    res.json({ ok: true, lead: result.rows[0] });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
-});
-
-app.post("/api/leads", async (req, res) => {
-  try {
-    const { nome, whatsapp, email, estabelecimento, tipo, cidade, status, origem, notas } = req.body;
-    if (!nome || !whatsapp || !estabelecimento) return res.status(400).json({ ok: false, error: "nome, whatsapp e estabelecimento são obrigatórios" });
-    const result = await db.query(
-      `INSERT INTO leads (nome, whatsapp, email, estabelecimento, tipo, cidade, status, origem, notas, data)
-       VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,NOW()) RETURNING *`,
-      [nome, whatsapp, email || null, estabelecimento, tipo || "Food service", cidade || "Montes Claros", status || "novo", origem || "manual", notas || null]
+    const { email, senha } = req.body;
+    if (!email || !senha)
+      return res.status(400).json({ ok: false, error: "email e senha são obrigatórios" });
+    const r = await db.query(
+      "SELECT id, tenant_id, role, senha_hash, ativo, precisa_trocar_senha FROM users WHERE email = $1",
+      [email.toLowerCase().trim()]
     );
-    res.status(201).json({ ok: true, lead: result.rows[0] });
+    const u = r.rows[0];
+    if (!u || !u.ativo || !(await bcrypt.compare(senha, u.senha_hash)))
+      return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
+    const token = jwt.sign({ sub: u.id, role: u.role }, process.env.JWT_SECRET, { expiresIn: "8h" });
+    res.json({ ok: true, token, precisa_trocar_senha: u.precisa_trocar_senha });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+// Único endpoint acessível com precisa_trocar_senha = true (usa authLight).
+app.post("/auth/trocar-senha", authLight(), async (req, res) => {
+  try {
+    const { senha_atual, senha_nova } = req.body;
+    if (!senha_atual || !senha_nova)
+      return res.status(400).json({ ok: false, error: "senha_atual e senha_nova são obrigatórios" });
+    if (senha_nova.length < 8)
+      return res.status(400).json({ ok: false, error: "senha_nova deve ter ao menos 8 caracteres" });
+    const r = await db.query("SELECT senha_hash FROM users WHERE id = $1", [req.user.id]);
+    if (!(await bcrypt.compare(senha_atual, r.rows[0].senha_hash)))
+      return res.status(401).json({ ok: false, error: "Senha atual incorreta" });
+    const hash = await bcrypt.hash(senha_nova, 12);
+    await db.query(
+      "UPDATE users SET senha_hash = $1, precisa_trocar_senha = false WHERE id = $2",
+      [hash, req.user.id]
+    );
+    res.json({ ok: true });
+  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+});
+
+app.post("/auth/criar-usuario", auth("super_admin", "tenant_admin"), async (req, res) => {
+  try {
+    const { nome, email, senha_provisoria, role, tenant_id } = req.body;
+    if (!nome || !email || !senha_provisoria || !role)
+      return res.status(400).json({ ok: false, error: "nome, email, senha_provisoria e role são obrigatórios" });
+    if (req.user.role === "tenant_admin") {
+      if (role !== "atendente")
+        return res.status(403).json({ ok: false, error: "tenant_admin só pode criar atendentes" });
+      if (tenant_id && tenant_id !== req.user.tenantId)
+        return res.status(403).json({ ok: false, error: "Sem permissão para esse tenant" });
+    }
+    const targetTenantId = req.user.role === "super_admin" ? (tenant_id || null) : req.user.tenantId;
+    const hash = await bcrypt.hash(senha_provisoria, 12);
+    const r = await db.query(
+      `INSERT INTO users (tenant_id, nome, email, senha_hash, role, precisa_trocar_senha)
+       VALUES ($1,$2,$3,$4,$5,true) RETURNING id, nome, email, role, criado_em`,
+      [targetTenantId, nome, email.toLowerCase().trim(), hash, role]
+    );
+    res.status(201).json({ ok: true, user: r.rows[0] });
   } catch (err) {
-    if (err.code === "23505") return res.status(409).json({ ok: false, error: "WhatsApp já cadastrado" });
+    if (err.code === "23505") return res.status(409).json({ ok: false, error: "E-mail já cadastrado" });
     res.status(500).json({ ok: false, error: err.message });
   }
 });
 
-app.patch("/api/leads/:id", async (req, res) => {
+// ════════════════════════════════════════════════════════════════════════════
+// ─── API DO CRM ─────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/contacts", auth("super_admin", "tenant_admin", "atendente"), async (req, res) => {
   try {
-    const { status, notas, nome, estabelecimento, tipo, cidade, email, origem, proxima_acao, proxima_acao_desc } = req.body;
-    try { await db.query('ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao TIMESTAMPTZ'); await db.query('ALTER TABLE leads ADD COLUMN IF NOT EXISTS proxima_acao_desc TEXT'); } catch(_) {}
+    const tenantId = resolveTenantId(req);
+    const { etapa_funil, search } = req.query;
+    let query = "SELECT * FROM contacts WHERE tenant_id = $1";
+    const params = [tenantId];
+    if (etapa_funil) { params.push(etapa_funil); query += ` AND etapa_funil = $${params.length}`; }
+    if (search) { params.push(`%${search}%`); query += ` AND (nome ILIKE $${params.length} OR telefone ILIKE $${params.length})`; }
+    query += " ORDER BY atualizado_em DESC";
+    const result = await db.query(query, params);
+    res.json({ ok: true, contacts: result.rows });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/contacts/:id", auth("super_admin", "tenant_admin", "atendente"), async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
     const result = await db.query(
-      `UPDATE leads SET
-        status = COALESCE($1,status), notas = COALESCE($2,notas),
-        nome = COALESCE($3,nome), estabelecimento = COALESCE($4,estabelecimento),
-        tipo = COALESCE($5,tipo), cidade = COALESCE($6,cidade),
-        email = COALESCE($7,email), origem = COALESCE($8,origem),
-        proxima_acao = $9, proxima_acao_desc = $10,
-        atualizado = NOW()
-       WHERE id = $11 RETURNING *`,
-      [status, notas, nome, estabelecimento, tipo, cidade, email, origem,
-       proxima_acao ?? null, proxima_acao_desc ?? null, req.params.id]
+      "SELECT * FROM contacts WHERE id = $1 AND tenant_id = $2",
+      [req.params.id, tenantId]
     );
-    if (!result.rows.length) return res.status(404).json({ ok: false, error: "Lead não encontrado" });
-    res.json({ ok: true, lead: result.rows[0] });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+    if (!result.rows.length) return res.status(404).json({ ok: false, error: "Contato não encontrado" });
+    res.json({ ok: true, contact: result.rows[0] });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
-app.delete("/api/leads/:id", async (req, res) => {
+app.post("/api/contacts", auth("super_admin", "tenant_admin"), async (req, res) => {
   try {
-    const result = await db.query("DELETE FROM leads WHERE id = $1 RETURNING id", [req.params.id]);
-    if (!result.rows.length) return res.status(404).json({ ok: false, error: "Lead não encontrado" });
+    const tenantId = resolveTenantId(req);
+    const { nome, telefone, email, etapa_funil, campos_customizados } = req.body;
+    if (!nome || !telefone)
+      return res.status(400).json({ ok: false, error: "nome e telefone são obrigatórios" });
+    const result = await db.query(
+      `INSERT INTO contacts (tenant_id, nome, telefone, email, etapa_funil, campos_customizados)
+       VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+      [tenantId, nome, telefone, email || null, etapa_funil || "novo_lead", campos_customizados || {}]
+    );
+    res.status(201).json({ ok: true, contact: result.rows[0] });
+  } catch (err) {
+    if (err.code === "23505") return res.status(409).json({ ok: false, error: "Telefone já cadastrado neste tenant" });
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.patch("/api/contacts/:id", auth("super_admin", "tenant_admin", "atendente"), async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
+    const { nome, telefone, email, etapa_funil, campos_customizados, atendente_id } = req.body;
+    const result = await db.query(
+      `UPDATE contacts SET
+        nome              = COALESCE($1, nome),
+        telefone          = COALESCE($2, telefone),
+        email             = COALESCE($3, email),
+        etapa_funil       = COALESCE($4, etapa_funil),
+        campos_customizados = COALESCE($5, campos_customizados),
+        atendente_id      = COALESCE($6, atendente_id),
+        atualizado_em     = NOW()
+       WHERE id = $7 AND tenant_id = $8 RETURNING *`,
+      [nome, telefone, email, etapa_funil, campos_customizados, atendente_id, req.params.id, tenantId]
+    );
+    if (!result.rows.length) return res.status(404).json({ ok: false, error: "Contato não encontrado" });
+    res.json({ ok: true, contact: result.rows[0] });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.delete("/api/contacts/:id", auth("super_admin", "tenant_admin"), async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
+    const result = await db.query(
+      "DELETE FROM contacts WHERE id = $1 AND tenant_id = $2 RETURNING id",
+      [req.params.id, tenantId]
+    );
+    if (!result.rows.length) return res.status(404).json({ ok: false, error: "Contato não encontrado" });
     res.json({ ok: true, deleted: result.rows[0].id });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
-app.get("/api/stats", async (req, res) => {
+app.get("/api/stats", auth("super_admin", "tenant_admin"), async (req, res) => {
   try {
-    const [total, porStatus, porOrigem, semana] = await Promise.all([
-      db.query("SELECT COUNT(*) as total FROM leads"),
-      db.query("SELECT status, COUNT(*) as count FROM leads GROUP BY status"),
-      db.query("SELECT origem, COUNT(*) as count FROM leads GROUP BY origem"),
-      db.query("SELECT COUNT(*) as count FROM leads WHERE data >= NOW() - INTERVAL '7 days'"),
+    const tenantId = resolveTenantId(req);
+    const [total, porEtapa, semana] = await Promise.all([
+      db.query("SELECT COUNT(*) as total FROM contacts WHERE tenant_id = $1", [tenantId]),
+      db.query("SELECT etapa_funil, COUNT(*) as count FROM contacts WHERE tenant_id = $1 GROUP BY etapa_funil", [tenantId]),
+      db.query("SELECT COUNT(*) as count FROM contacts WHERE tenant_id = $1 AND criado_em >= NOW() - INTERVAL '7 days'", [tenantId]),
     ]);
-    res.json({ ok: true, total: parseInt(total.rows[0].total), semana: parseInt(semana.rows[0].count), porStatus: porStatus.rows, porOrigem: porOrigem.rows });
-  } catch (err) { res.status(500).json({ ok: false, error: err.message }); }
+    res.json({ ok: true, total: parseInt(total.rows[0].total), semana: parseInt(semana.rows[0].count), porEtapa: porEtapa.rows });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
 });
 
 // ─── UTILITÁRIOS ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({ status: "ok", service: "Sofia Fan Fave", timestamp: new Date().toISOString() }));
 
-app.get("/sessions", (_, res) => {
+app.get("/sessions", auth("super_admin"), (req, res) => {
   const list = [];
   for (const [phone, s] of sessions.entries()) {
     list.push({ phone, messages: s.history.length, qualified: s.qualified, followupStatus: s.followupStatus, lastActivity: new Date(s.lastActivity).toISOString() });
@@ -547,7 +702,7 @@ app.get("/sessions", (_, res) => {
   res.json({ total: list.length, sessions: list });
 });
 
-app.post("/send", async (req, res) => {
+app.post("/send", auth("super_admin"), async (req, res) => {
   const { phone, message } = req.body;
   if (!phone || !message) return res.status(400).json({ error: "phone e message são obrigatórios" });
   try { res.json({ ok: true, result: await sendWhatsApp(phone, message) }); }

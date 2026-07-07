@@ -44,9 +44,10 @@ CREATE TABLE users (
     nome            VARCHAR(150) NOT NULL,
     email           VARCHAR(150) UNIQUE NOT NULL,
     senha_hash      VARCHAR(255) NOT NULL,
-    role            VARCHAR(20) NOT NULL DEFAULT 'atendente', -- 'super_admin', 'tenant_admin', 'atendente'
-    ativo           BOOLEAN DEFAULT true,
-    criado_em       TIMESTAMPTZ DEFAULT now()
+    role                 VARCHAR(20)  NOT NULL DEFAULT 'atendente', -- 'super_admin', 'tenant_admin', 'atendente'
+    ativo                BOOLEAN      DEFAULT true,
+    precisa_trocar_senha BOOLEAN      DEFAULT true,
+    criado_em            TIMESTAMPTZ  DEFAULT now()
 );
 CREATE INDEX idx_users_tenant ON users(tenant_id);
 
