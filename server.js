@@ -597,6 +597,15 @@ if (process.env.DISABLE_FOLLOWUP_JOB === "true") {
 // ─── WEBHOOK PRINCIPAL ────────────────────────────────────────────────────────
 app.post("/webhook/whatsapp", async (req, res) => {
   const body = req.body;
+
+  // Diagnóstico temporário (Fase 5 rollout, bug do instance_id não resolvendo):
+  // imprime o payload exatamente como a Z-API mandou, antes de qualquer
+  // filtro ou lookup, pra comparar byte a byte contra o que está no banco.
+  // Só leitura/log — remover depois que a causa for confirmada.
+  console.log(`🔍 DEBUG instanceId: ${JSON.stringify(body?.instanceId)} (length ${body?.instanceId?.length ?? "n/a"}, hex ${body?.instanceId ? Buffer.from(String(body.instanceId), "utf8").toString("hex") : "n/a"})`);
+  console.log(`🔍 DEBUG body keys: ${JSON.stringify(Object.keys(body ?? {}))}`);
+  console.log(`🔍 DEBUG body completo: ${JSON.stringify(body)}`);
+
   if (body.fromMe || body.isGroup || body.type !== "ReceivedCallback") return res.sendStatus(200);
 
   // Resolve tenant a partir da instância Z-API que recebeu a mensagem — só
