@@ -4,6 +4,7 @@ import pg from "pg";
 import Anthropic from "@anthropic-ai/sdk";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 
 const app = express();
 app.use(cors());
@@ -60,6 +61,8 @@ async function setupDb() {
       ativo          BOOLEAN      DEFAULT true,
       atualizado_em  TIMESTAMPTZ  DEFAULT now()
     )`,
+    `ALTER TABLE agent_config ADD COLUMN IF NOT EXISTS definicao_funcao TEXT`,
+    `ALTER TABLE agent_config ADD COLUMN IF NOT EXISTS sobre_empresa    TEXT`,
     `CREATE TABLE IF NOT EXISTS whatsapp_instances (
       id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       tenant_id    UUID         NOT NULL REFERENCES tenants(id),
@@ -73,6 +76,15 @@ async function setupDb() {
     )`,
     `CREATE INDEX        IF NOT EXISTS idx_whatsapp_tenant      ON whatsapp_instances(tenant_id)`,
     `CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_instance_id ON whatsapp_instances(instance_id)`,
+    // Fase 5: provider (zapi/meta), segredo de webhook por tenant, colunas de
+    // credencial ampliadas pra TEXT (o blob cifrado + tokens longos de outros
+    // providers no futuro), e 1 instância por tenant (necessário pro upsert
+    // em ON CONFLICT (tenant_id) do endpoint de connect).
+    `ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS provider VARCHAR(20) NOT NULL DEFAULT 'zapi'`,
+    `ALTER TABLE whatsapp_instances ADD COLUMN IF NOT EXISTS webhook_secret TEXT`,
+    `ALTER TABLE whatsapp_instances ALTER COLUMN token TYPE TEXT`,
+    `ALTER TABLE whatsapp_instances ALTER COLUMN client_token TYPE TEXT`,
+    `CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_instances_tenant ON whatsapp_instances(tenant_id)`,
     `CREATE TABLE IF NOT EXISTS tenant_modules (
       tenant_id  UUID        NOT NULL REFERENCES tenants(id),
       modulo_key VARCHAR(50) NOT NULL,
@@ -142,7 +154,95 @@ async function setupDb() {
 
   for (const sql of statements) await db.query(sql);
 
+  await migrateWhatsappCredentials();
+
   console.log("✅ Banco configurado");
+}
+
+// ─── CREDENCIAIS DE WHATSAPP (criptografia em repouso) ───────────────────────
+// AES-256-GCM na aplicação — a chave nunca precisa viver no banco, e GCM
+// autentica o conteúdo (detecta adulteração), não só cifra.
+const CRED_KEY = process.env.CREDENTIALS_ENCRYPTION_KEY
+  ? Buffer.from(process.env.CREDENTIALS_ENCRYPTION_KEY, "hex")
+  : null;
+
+function encryptCredential(plain) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", CRED_KEY, iv);
+  const ciphertext = Buffer.concat([cipher.update(String(plain), "utf8"), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString("base64")}:${tag.toString("base64")}:${ciphertext.toString("base64")}`;
+}
+
+function decryptCredential(stored) {
+  const [ivB64, tagB64, dataB64] = String(stored).split(":");
+  const decipher = crypto.createDecipheriv("aes-256-gcm", CRED_KEY, Buffer.from(ivB64, "base64"));
+  decipher.setAuthTag(Buffer.from(tagB64, "base64"));
+  const plain = Buffer.concat([decipher.update(Buffer.from(dataB64, "base64")), decipher.final()]);
+  return plain.toString("utf8");
+}
+
+// Detecta o formato "iv:tag:cipher" gerado por encryptCredential(), pra
+// distinguir de um valor legado ainda em texto puro.
+function isEncrypted(value) {
+  if (typeof value !== "string") return false;
+  const parts = value.split(":");
+  if (parts.length !== 3) return false;
+  try {
+    const iv = Buffer.from(parts[0], "base64");
+    const tag = Buffer.from(parts[1], "base64");
+    return iv.length === 12 && tag.length === 16;
+  } catch {
+    return false;
+  }
+}
+
+// Nunca devolver o valor completo em resposta de API — só os últimos 4 chars.
+function maskCredential(plain) {
+  const str = String(plain || "");
+  if (str.length <= 4) return "••••";
+  return "••••" + str.slice(-4);
+}
+
+// Roda em todo boot (idempotente): cifra qualquer token/client_token ainda em
+// texto puro (dados de antes da Fase 5) e gera webhook_secret pra linhas que
+// ainda não têm. Só toca linhas que precisam.
+async function migrateWhatsappCredentials() {
+  if (!CRED_KEY) {
+    console.warn("⚠️ CREDENTIALS_ENCRYPTION_KEY não definida — pulando migração de credenciais de WhatsApp");
+    return;
+  }
+  const rows = (await db.query(`SELECT id, token, client_token, webhook_secret FROM whatsapp_instances`)).rows;
+  for (const row of rows) {
+    const sets = [];
+    const values = [];
+    if (!isEncrypted(row.token)) {
+      values.push(encryptCredential(row.token));
+      sets.push(`token = $${values.length}`);
+    }
+    if (!isEncrypted(row.client_token)) {
+      values.push(encryptCredential(row.client_token));
+      sets.push(`client_token = $${values.length}`);
+    }
+    if (!row.webhook_secret) {
+      values.push(crypto.randomBytes(32).toString("hex"));
+      sets.push(`webhook_secret = $${values.length}`);
+    }
+    if (sets.length) {
+      values.push(row.id);
+      await db.query(`UPDATE whatsapp_instances SET ${sets.join(", ")} WHERE id = $${values.length}`, values);
+      console.log(`🔐 whatsapp_instances ${row.id}: ${sets.map(s => s.split(" =")[0]).join(", ")} atualizado(s)`);
+    }
+  }
+}
+
+// Compara dois segredos em tempo constante sem lançar exceção quando os
+// tamanhos diferem (ex.: alguém manda um ?secret= curto/errado).
+function timingSafeEqualStrings(a, b) {
+  const bufA = Buffer.from(String(a ?? ""));
+  const bufB = Buffer.from(String(b ?? ""));
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
 }
 
 // ─── AUTENTICAÇÃO ─────────────────────────────────────────────────────────────
@@ -211,12 +311,17 @@ function resolveTenantId(req) {
 async function resolveInstance(instanceId) {
   try {
     const result = await db.query(
-      `SELECT tenant_id, token, client_token FROM whatsapp_instances WHERE instance_id = $1`,
+      `SELECT tenant_id, token, client_token, webhook_secret FROM whatsapp_instances WHERE instance_id = $1`,
       [instanceId]
     );
     if (!result.rows.length) return null;
     const row = result.rows[0];
-    return { tenantId: row.tenant_id, token: row.token, clientToken: row.client_token };
+    return {
+      tenantId: row.tenant_id,
+      token: decryptCredential(row.token),
+      clientToken: decryptCredential(row.client_token),
+      webhookSecret: row.webhook_secret,
+    };
   } catch (err) {
     console.error("Erro ao resolver instância:", err.message);
     return null;
@@ -382,7 +487,11 @@ async function findWhatsAppCreds(tenantId) {
     [tenantId]
   );
   if (!r.rows.length) return null;
-  return { instanceId: r.rows[0].instance_id, token: r.rows[0].token, clientToken: r.rows[0].client_token };
+  return {
+    instanceId: r.rows[0].instance_id,
+    token: decryptCredential(r.rows[0].token),
+    clientToken: decryptCredential(r.rows[0].client_token),
+  };
 }
 
 // Job roda a cada 15 minutos. Considera "silêncio" o tempo desde a última
@@ -446,10 +555,16 @@ async function runFollowUpJob() {
       await sendWhatsApp(row.telefone, msg, creds);
       await saveMessage(row.tenant_id, row.conversation_id, "agente_ia", msg);
 
-      if (tipo === "1h")  await db.query(`UPDATE conversations SET followup_1h  = true WHERE id = $1`, [row.conversation_id]);
-      if (tipo === "24h") await db.query(`UPDATE conversations SET followup_24h = true WHERE id = $1`, [row.conversation_id]);
+      // Marca também os tiers inferiores como satisfeitos — sem isso, mandar o
+      // de 24h não impede o de 1h de disparar de novo numa próxima execução.
+      if (tipo === "1h") {
+        await db.query(`UPDATE conversations SET followup_1h = true WHERE id = $1`, [row.conversation_id]);
+      }
+      if (tipo === "24h") {
+        await db.query(`UPDATE conversations SET followup_1h = true, followup_24h = true WHERE id = $1`, [row.conversation_id]);
+      }
       if (tipo === "7d") {
-        await db.query(`UPDATE conversations SET followup_7d = true WHERE id = $1`, [row.conversation_id]);
+        await db.query(`UPDATE conversations SET followup_1h = true, followup_24h = true, followup_7d = true WHERE id = $1`, [row.conversation_id]);
         await archiveConversation(row.conversation_id);
       }
     }
@@ -460,25 +575,42 @@ async function runFollowUpJob() {
   }
 }
 
-setInterval(runFollowUpJob, 15 * 60 * 1000);
+// DISABLE_FOLLOWUP_JOB=true impede até o registro do setInterval — usado ao
+// rodar o servidor localmente contra o banco de produção pra testes, pra
+// nunca disparar follow-ups reais sem querer.
+if (process.env.DISABLE_FOLLOWUP_JOB === "true") {
+  console.log("⏸️ Job de follow-up desabilitado (DISABLE_FOLLOWUP_JOB=true)");
+} else {
+  setInterval(runFollowUpJob, 15 * 60 * 1000);
+}
 
 // ─── WEBHOOK PRINCIPAL ────────────────────────────────────────────────────────
 app.post("/webhook/whatsapp", async (req, res) => {
-  res.sendStatus(200);
-
   const body = req.body;
-  if (body.fromMe || body.isGroup || body.type !== "ReceivedCallback") return;
+  if (body.fromMe || body.isGroup || body.type !== "ReceivedCallback") return res.sendStatus(200);
+
+  // Resolve tenant a partir da instância Z-API que recebeu a mensagem — só
+  // uma leitura, necessária pra saber qual segredo comparar no próximo passo.
+  const instance = await resolveInstance(body.instanceId);
+  if (!instance) {
+    console.warn(`⚠️ Instância desconhecida: ${body.instanceId}`);
+    return res.sendStatus(200); // não vaza se o instanceId existe ou não
+  }
+
+  // Valida o segredo do webhook ANTES de qualquer escrita em contacts/
+  // conversations/messages. A Z-API é configurada (no painel, por tenant)
+  // pra chamar .../webhook/whatsapp?secret=<webhook_secret>.
+  if (!timingSafeEqualStrings(req.query.secret, instance.webhookSecret)) {
+    console.warn(`⚠️ Segredo de webhook inválido para instância ${body.instanceId}`);
+    return res.status(401).json({ ok: false, error: "Assinatura de webhook inválida" });
+  }
+
+  res.sendStatus(200);
 
   const phone = body.phone?.replace(/\D/g, "");
   const text  = body.text?.message || body.audio?.transcription || body.image?.caption || body.document?.caption;
   if (!phone || !text) return;
 
-  // Resolve tenant a partir da instância Z-API que recebeu a mensagem
-  const instance = await resolveInstance(body.instanceId);
-  if (!instance) {
-    console.warn(`⚠️ Instância desconhecida: ${body.instanceId}`);
-    return;
-  }
   const { tenantId, token, clientToken } = instance;
   const creds = { instanceId: body.instanceId, token, clientToken };
 
@@ -717,6 +849,122 @@ app.get("/api/stats", auth("super_admin", "tenant_admin"), async (req, res) => {
   }
 });
 
+// ════════════════════════════════════════════════════════════════════════════
+// ─── AGENT CONFIG (persona do agente, editável no CRM) ─────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+app.get("/api/agent-config", auth("super_admin", "tenant_admin"), async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
+    const r = await db.query(
+      `SELECT nome_agente, tom_de_voz, definicao_funcao, sobre_empresa FROM agent_config WHERE tenant_id = $1`,
+      [tenantId]
+    );
+    if (!r.rows.length) return res.json({ ok: true, exists: false });
+    res.json({ ok: true, exists: true, ...r.rows[0] });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.patch("/api/agent-config", auth("super_admin", "tenant_admin"), async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
+    const { nome_agente, tom_de_voz, definicao_funcao, sobre_empresa } = req.body;
+    if (!nome_agente || !definicao_funcao || !sobre_empresa)
+      return res.status(400).json({ ok: false, error: "nome_agente, definicao_funcao e sobre_empresa são obrigatórios" });
+    const personaPrompt = `${definicao_funcao}\n\n${sobre_empresa}`;
+    const result = await db.query(
+      `INSERT INTO agent_config (tenant_id, nome_agente, tom_de_voz, definicao_funcao, sobre_empresa, persona_prompt)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       ON CONFLICT (tenant_id) DO UPDATE SET
+         nome_agente      = $2,
+         tom_de_voz       = $3,
+         definicao_funcao = $4,
+         sobre_empresa    = $5,
+         persona_prompt   = $6,
+         atualizado_em    = NOW()
+       RETURNING nome_agente, tom_de_voz, definicao_funcao, sobre_empresa`,
+      [tenantId, nome_agente, tom_de_voz || "amigavel", definicao_funcao, sobre_empresa, personaPrompt]
+    );
+    res.json({ ok: true, ...result.rows[0] });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ─── WHATSAPP (conectar instância por tenant) ───────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+
+app.post("/api/whatsapp/connect", auth("super_admin", "tenant_admin"), async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
+    const { provider, instanceId, token, clientToken, numero } = req.body;
+    const prov = provider || "zapi";
+    if (prov === "zapi" && (!instanceId || !token || !clientToken))
+      return res.status(400).json({ ok: false, error: "instanceId, token e clientToken são obrigatórios para provider zapi" });
+
+    const existing = await db.query(`SELECT webhook_secret FROM whatsapp_instances WHERE tenant_id = $1`, [tenantId]);
+    const webhookSecret = existing.rows[0]?.webhook_secret || crypto.randomBytes(32).toString("hex");
+
+    const result = await db.query(
+      `INSERT INTO whatsapp_instances (tenant_id, provider, instance_id, token, client_token, numero, status, conectado_em, webhook_secret)
+       VALUES ($1,$2,$3,$4,$5,$6,'conectado',NOW(),$7)
+       ON CONFLICT (tenant_id) DO UPDATE SET
+         provider     = $2,
+         instance_id  = $3,
+         token        = $4,
+         client_token = $5,
+         numero       = $6,
+         status       = 'conectado',
+         conectado_em = NOW(),
+         webhook_secret = COALESCE(whatsapp_instances.webhook_secret, $7)
+       RETURNING provider, numero, status, webhook_secret`,
+      [tenantId, prov, instanceId, encryptCredential(token), encryptCredential(clientToken), numero || null, webhookSecret]
+    );
+    const row = result.rows[0];
+    res.status(201).json({
+      ok: true,
+      provider: row.provider,
+      numero: row.numero,
+      status: row.status,
+      tokenPreview: maskCredential(token),
+      webhookUrl: `${req.protocol}://${req.get("host")}/webhook/whatsapp?secret=${row.webhook_secret}`,
+    });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    if (err.code === "23505") return res.status(409).json({ ok: false, error: "instanceId já está em uso por outro tenant" });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+app.get("/api/whatsapp/status", auth("super_admin", "tenant_admin"), async (req, res) => {
+  try {
+    const tenantId = resolveTenantId(req);
+    const r = await db.query(
+      `SELECT provider, numero, status, conectado_em, token FROM whatsapp_instances WHERE tenant_id = $1`,
+      [tenantId]
+    );
+    if (!r.rows.length) return res.json({ ok: true, connected: false });
+    const row = r.rows[0];
+    res.json({
+      ok: true,
+      connected: true,
+      provider: row.provider,
+      numero: row.numero,
+      status: row.status,
+      conectadoEm: row.conectado_em,
+      tokenPreview: maskCredential(decryptCredential(row.token)),
+    });
+  } catch (err) {
+    if (err.message.includes("tenant_id obrigatório")) return res.status(400).json({ ok: false, error: err.message });
+    res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
 // ─── UTILITÁRIOS ──────────────────────────────────────────────────────────────
 app.get("/health", (_, res) => res.json({ status: "ok", service: "Sofia Fan Fave", timestamp: new Date().toISOString() }));
 
@@ -734,5 +982,5 @@ app.listen(PORT, async () => {
   console.log(`🤖 Sofia online na porta ${PORT}`);
   console.log(`📡 Webhook: /webhook/whatsapp`);
   console.log(`📊 API CRM: /api/contacts`);
-  console.log(`⏰ Follow-up job: a cada 15 minutos`);
+  console.log(process.env.DISABLE_FOLLOWUP_JOB === "true" ? `⏸️ Follow-up job: desabilitado` : `⏰ Follow-up job: a cada 15 minutos`);
 });

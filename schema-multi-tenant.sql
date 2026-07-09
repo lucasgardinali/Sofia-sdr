@@ -59,27 +59,35 @@ CREATE TABLE agent_config (
     tenant_id       UUID PRIMARY KEY REFERENCES tenants(id),
     nome_agente     VARCHAR(50) NOT NULL,           -- nome escolhido pelo cliente, livre
     tom_de_voz      VARCHAR(50) DEFAULT 'amigavel',  -- 'formal', 'amigavel', 'divertido'
-    persona_prompt  TEXT NOT NULL,                   -- prompt final: base do segmento + customização do cliente
+    persona_prompt  TEXT NOT NULL,                   -- prompt final: composto de definicao_funcao + sobre_empresa
+    definicao_funcao TEXT,                           -- bloco editável no CRM: papel/objetivo do agente
+    sobre_empresa   TEXT,                            -- bloco editável no CRM: produtos/serviços/empresa
     manager_phone   VARCHAR(20),                     -- número que recebe alertas de lead qualificado (DDI+DDD+número)
     ativo           BOOLEAN DEFAULT true,
     atualizado_em   TIMESTAMPTZ DEFAULT now()
 );
 
 -- ------------------------------------------------------------
--- 5. WHATSAPP_INSTANCES — 1 número/instância Z-API por tenant
+-- 5. WHATSAPP_INSTANCES — 1 número/instância por tenant
+-- token/client_token ficam cifrados em repouso (AES-256-GCM, ver
+-- encryptCredential() em server.js) — nunca gravar/ler em texto puro fora
+-- do processo da aplicação. webhook_secret é o segredo comparado em
+-- /webhook/whatsapp?secret=... antes de processar qualquer mensagem.
 -- ------------------------------------------------------------
 CREATE TABLE whatsapp_instances (
     id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id       UUID NOT NULL REFERENCES tenants(id),
+    provider        VARCHAR(20) NOT NULL DEFAULT 'zapi', -- 'zapi' (funcional) ou 'meta' (reservado, não implementado)
     instance_id     VARCHAR(100) NOT NULL,   -- ID da instância na Z-API
-    token           VARCHAR(255) NOT NULL,   -- token da instância (URL path)
-    client_token    VARCHAR(255) NOT NULL,   -- header Client-Token da Z-API
+    token           TEXT NOT NULL,           -- cifrado: token da instância (URL path)
+    client_token    TEXT NOT NULL,           -- cifrado: header Client-Token da Z-API
+    webhook_secret  TEXT,                    -- comparado contra ?secret= no webhook inbound
     numero          VARCHAR(20),
     status          VARCHAR(20) DEFAULT 'pendente', -- 'pendente', 'conectado', 'desconectado'
     conectado_em    TIMESTAMPTZ,
     criado_em       TIMESTAMPTZ DEFAULT now()
 );
-CREATE INDEX idx_whatsapp_tenant ON whatsapp_instances(tenant_id);
+CREATE UNIQUE INDEX idx_whatsapp_instances_tenant ON whatsapp_instances(tenant_id); -- 1 instância por tenant, e habilita ON CONFLICT (tenant_id)
 CREATE UNIQUE INDEX idx_whatsapp_instance_id ON whatsapp_instances(instance_id);
 
 -- ------------------------------------------------------------

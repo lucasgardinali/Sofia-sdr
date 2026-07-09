@@ -50,23 +50,29 @@ CREATE TABLE IF NOT EXISTS agent_config (
     nome_agente    VARCHAR(50)  NOT NULL,
     tom_de_voz     VARCHAR(50)  DEFAULT 'amigavel',
     persona_prompt TEXT         NOT NULL,
+    definicao_funcao TEXT,
+    sobre_empresa  TEXT,
     manager_phone  VARCHAR(20),
     ativo          BOOLEAN      DEFAULT true,
     atualizado_em  TIMESTAMPTZ  DEFAULT now()
 );
 
+-- token/client_token ficam cifrados em repouso (AES-256-GCM, ver server.js).
+-- webhook_secret é comparado contra ?secret= em /webhook/whatsapp.
 CREATE TABLE IF NOT EXISTS whatsapp_instances (
-    id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    tenant_id    UUID         NOT NULL REFERENCES tenants(id),
-    instance_id  VARCHAR(100) NOT NULL,
-    token        VARCHAR(255) NOT NULL,
-    client_token VARCHAR(255) NOT NULL,
-    numero       VARCHAR(20),
-    status       VARCHAR(20)  DEFAULT 'pendente',
-    conectado_em TIMESTAMPTZ,
-    criado_em    TIMESTAMPTZ  DEFAULT now()
+    id             UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    tenant_id      UUID         NOT NULL REFERENCES tenants(id),
+    provider       VARCHAR(20)  NOT NULL DEFAULT 'zapi',
+    instance_id    VARCHAR(100) NOT NULL,
+    token          TEXT         NOT NULL,
+    client_token   TEXT         NOT NULL,
+    webhook_secret TEXT,
+    numero         VARCHAR(20),
+    status         VARCHAR(20)  DEFAULT 'pendente',
+    conectado_em   TIMESTAMPTZ,
+    criado_em      TIMESTAMPTZ  DEFAULT now()
 );
-CREATE INDEX        IF NOT EXISTS idx_whatsapp_tenant      ON whatsapp_instances(tenant_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_instances_tenant ON whatsapp_instances(tenant_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_whatsapp_instance_id ON whatsapp_instances(instance_id);
 
 CREATE TABLE IF NOT EXISTS tenant_modules (
@@ -257,6 +263,9 @@ ON CONFLICT (tenant_id) DO NOTHING;
 -- Preencher com as credenciais reais da Z-API antes de subir.
 -- ════════════════════════════════════════════════════════════
 
+-- token/client_token entram em texto puro aqui só neste seed manual — o
+-- próximo boot do server.js (migrateWhatsappCredentials, ver server.js)
+-- cifra automaticamente e gera o webhook_secret pra essa linha.
 INSERT INTO whatsapp_instances (tenant_id, instance_id, token, client_token, status)
 VALUES (
     'fa000000-0000-0000-0000-000000000001',
