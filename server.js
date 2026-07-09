@@ -606,23 +606,19 @@ app.post("/webhook/whatsapp", async (req, res) => {
   console.log(`🔍 DEBUG body keys: ${JSON.stringify(Object.keys(body ?? {}))}`);
   console.log(`🔍 DEBUG body completo: ${JSON.stringify(body)}`);
 
-  if (body.fromMe || body.isGroup || body.type !== "ReceivedCallback") return res.sendStatus(200);
-
-  // Resolve tenant a partir da instância Z-API que recebeu a mensagem — só
-  // uma leitura, necessária pra saber qual segredo comparar no próximo passo.
-  const instance = await resolveInstance(body.instanceId);
-  if (!instance) {
-    console.warn(`⚠️ Instância desconhecida: ${body.instanceId}`);
-    return res.sendStatus(200); // não vaza se o instanceId existe ou não
-  }
-
-  // Valida o segredo do webhook ANTES de qualquer escrita em contacts/
-  // conversations/messages. A Z-API é configurada (no painel, por tenant)
-  // pra chamar .../webhook/whatsapp?secret=<webhook_secret>.
-  if (!timingSafeEqualStrings(req.query.secret, instance.webhookSecret)) {
-    console.warn(`⚠️ Segredo de webhook inválido para instância ${body.instanceId}`);
+  // Resolve tenant e valida o segredo do webhook ANTES de qualquer outro
+  // early-return ou processamento — inclusive antes do filtro fromMe/isGroup/
+  // type. Instância desconhecida também cai aqui (não há segredo válido pra
+  // comparar contra), com a MESMA resposta 401 do segredo errado, pra não
+  // vazar se o instanceId existe ou não (antes: instância desconhecida = 200,
+  // segredo errado = 401 — isso por si só já vazava a existência do instanceId).
+  const instance = await resolveInstance(body?.instanceId);
+  if (!instance || !timingSafeEqualStrings(req.query.secret, instance.webhookSecret)) {
+    console.warn(`⚠️ Webhook rejeitado (segredo inválido ou instância desconhecida): ${body?.instanceId}`);
     return res.status(401).json({ ok: false, error: "Assinatura de webhook inválida" });
   }
+
+  if (body.fromMe || body.isGroup || body.type !== "ReceivedCallback") return res.sendStatus(200);
 
   res.sendStatus(200);
 
