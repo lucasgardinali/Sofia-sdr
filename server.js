@@ -166,6 +166,16 @@ const CRED_KEY = process.env.CREDENTIALS_ENCRYPTION_KEY
   ? Buffer.from(process.env.CREDENTIALS_ENCRYPTION_KEY, "hex")
   : null;
 
+// Diagnóstico temporário (Fase 5 rollout): imprime só um fingerprint da
+// chave — nunca o valor — pra confirmar por hash que o env var do Railway
+// bate byte a byte com a chave usada para cifrar os dados existentes.
+// Remover depois que o rollout for confirmado.
+if (CRED_KEY) {
+  console.log(`🔑 CRED_KEY: ${CRED_KEY.length} bytes, fingerprint ${crypto.createHash("sha256").update(CRED_KEY).digest("hex").slice(0, 12)}`);
+} else {
+  console.warn("⚠️ CREDENTIALS_ENCRYPTION_KEY não definida");
+}
+
 function encryptCredential(plain) {
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", CRED_KEY, iv);
