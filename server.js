@@ -7,6 +7,10 @@ import bcrypt from "bcryptjs";
 import crypto from "crypto";
 
 const app = express();
+// Railway termina TLS na borda e repassa por HTTP puro — sem isso,
+// req.protocol sempre reporta "http", mesmo em produção (ex: a webhookUrl
+// gerada por /api/whatsapp/connect saía errada).
+app.set("trust proxy", true);
 app.use(cors());
 app.use(express.json());
 
