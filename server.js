@@ -5,6 +5,7 @@ import Anthropic from "@anthropic-ai/sdk";
 import jwt from "jsonwebtoken";
 import bcrypt from "bcryptjs";
 import crypto from "crypto";
+import rateLimit from "express-rate-limit";
 
 const app = express();
 // Railway termina TLS na borda e repassa por HTTP puro — sem isso,
@@ -739,6 +740,61 @@ app.post("/auth/criar-usuario", auth("super_admin", "tenant_admin"), async (req,
   } catch (err) {
     if (err.code === "23505") return res.status(409).json({ ok: false, error: "E-mail já cadastrado" });
     res.status(500).json({ ok: false, error: err.message });
+  }
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// ─── LEADS PÚBLICOS (formulário da landing page, SEM autenticação) ──────────
+// ════════════════════════════════════════════════════════════════════════════
+// Único endpoint do sistema que aceita requisição anônima da internet aberta.
+// Tenant é fixo — nunca lido do corpo da requisição, pra fechar qualquer
+// tentativa de escolher outro tenant via payload.
+const PUBLIC_LANDING_TENANT_ID = "fa000000-0000-0000-0000-000000000001";
+
+const SEGMENTOS_LANDING = [
+  "Restaurante", "Pizzaria", "Lanchonete", "Cafeteria",
+  "Padaria / Confeitaria", "Bar / Boteco", "Food truck", "Delivery", "Outro",
+];
+
+const publicLeadsLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 8,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { ok: false, error: "Muitas tentativas. Tente novamente em alguns minutos." },
+});
+
+app.post("/api/public/leads", publicLeadsLimiter, async (req, res) => {
+  // Honeypot: campo oculto que um usuário real nunca preenche. Bots que
+  // preenchem tudo cegamente caem aqui — responde 200 sem gravar nada, pra
+  // não sinalizar ao bot que foi detectado.
+  if (req.body?.nome_empresa_confirmacao) {
+    return res.json({ ok: true });
+  }
+
+  const nome            = String(req.body?.nome ?? "").trim().slice(0, 150);
+  const estabelecimento = String(req.body?.estabelecimento ?? "").trim().slice(0, 150);
+  const telefone         = String(req.body?.whatsapp ?? "").replace(/\D/g, "");
+  const tipo              = String(req.body?.tipo ?? "").trim();
+
+  if (!nome || !estabelecimento || !telefone || !tipo)
+    return res.status(400).json({ ok: false, error: "Preencha todos os campos" });
+  if (telefone.length < 10 || telefone.length > 11)
+    return res.status(400).json({ ok: false, error: "WhatsApp inválido" });
+  if (!SEGMENTOS_LANDING.includes(tipo))
+    return res.status(400).json({ ok: false, error: "Segmento inválido" });
+
+  try {
+    await db.query(
+      `INSERT INTO contacts (tenant_id, nome, telefone, etapa_funil, campos_customizados)
+       VALUES ($1,$2,$3,'novo_lead',$4)
+       ON CONFLICT (tenant_id, telefone) DO UPDATE SET atualizado_em = NOW()`,
+      [PUBLIC_LANDING_TENANT_ID, nome, telefone, { estabelecimento, segmento: tipo, origem: "landing" }]
+    );
+    res.status(201).json({ ok: true });
+  } catch (err) {
+    console.error("Erro ao salvar lead da landing page:", err.message);
+    res.status(500).json({ ok: false, error: "Erro ao salvar lead" });
   }
 });
 
