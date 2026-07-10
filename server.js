@@ -170,15 +170,6 @@ const CRED_KEY = process.env.CREDENTIALS_ENCRYPTION_KEY
   ? Buffer.from(process.env.CREDENTIALS_ENCRYPTION_KEY, "hex")
   : null;
 
-// Diagnóstico temporário (Fase 5 rollout): imprime só um fingerprint da
-// chave — nunca o valor — pra confirmar por hash que o env var do Railway
-// bate byte a byte com a chave usada para cifrar os dados existentes.
-// Remover depois que o rollout for confirmado.
-if (CRED_KEY) {
-  console.log(`🔑 CRED_KEY: ${CRED_KEY.length} bytes, fingerprint ${crypto.createHash("sha256").update(CRED_KEY).digest("hex").slice(0, 12)}`);
-} else {
-  console.warn("⚠️ CREDENTIALS_ENCRYPTION_KEY não definida");
-}
 
 function encryptCredential(plain) {
   const iv = crypto.randomBytes(12);
@@ -602,14 +593,6 @@ if (process.env.DISABLE_FOLLOWUP_JOB === "true") {
 app.post("/webhook/whatsapp", async (req, res) => {
   const body = req.body;
 
-  // Diagnóstico temporário (Fase 5 rollout, bug do instance_id não resolvendo):
-  // imprime o payload exatamente como a Z-API mandou, antes de qualquer
-  // filtro ou lookup, pra comparar byte a byte contra o que está no banco.
-  // Só leitura/log — remover depois que a causa for confirmada.
-  console.log(`🔍 DEBUG instanceId: ${JSON.stringify(body?.instanceId)} (length ${body?.instanceId?.length ?? "n/a"}, hex ${body?.instanceId ? Buffer.from(String(body.instanceId), "utf8").toString("hex") : "n/a"})`);
-  console.log(`🔍 DEBUG body keys: ${JSON.stringify(Object.keys(body ?? {}))}`);
-  console.log(`🔍 DEBUG body completo: ${JSON.stringify(body)}`);
-
   // Resolve tenant e valida o segredo do webhook ANTES de qualquer outro
   // early-return ou processamento — inclusive antes do filtro fromMe/isGroup/
   // type. Instância desconhecida também cai aqui (não há segredo válido pra
@@ -707,15 +690,6 @@ app.post("/auth/login", async (req, res) => {
       [email.toLowerCase().trim()]
     );
     const u = r.rows[0];
-    // Diagnóstico temporário (login do super_admin falhando mesmo com hash
-    // confirmado correto) — só fingerprint/lengths, nunca senha nem hash em
-    // texto. Remover depois que a causa for confirmada.
-    if (u) {
-      const compareResult = await bcrypt.compare(senha, u.senha_hash);
-      console.log(`🔍 DEBUG login: found=true ativo=${u.ativo} senhaLen=${senha.length} senhaFp=${crypto.createHash("sha256").update(senha).digest("hex").slice(0,12)} hashFp=${crypto.createHash("sha256").update(u.senha_hash).digest("hex").slice(0,12)} compare=${compareResult}`);
-    } else {
-      console.log(`🔍 DEBUG login: usuário não encontrado para email ${JSON.stringify(email.toLowerCase().trim())}`);
-    }
     if (!u || !u.ativo || !(await bcrypt.compare(senha, u.senha_hash)))
       return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
     const token = jwt.sign({ sub: u.id, role: u.role }, process.env.JWT_SECRET, { expiresIn: "8h" });
