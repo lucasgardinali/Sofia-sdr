@@ -703,6 +703,15 @@ app.post("/auth/login", async (req, res) => {
       [email.toLowerCase().trim()]
     );
     const u = r.rows[0];
+    // Diagnóstico temporário (login do super_admin falhando mesmo com hash
+    // confirmado correto) — só fingerprint/lengths, nunca senha nem hash em
+    // texto. Remover depois que a causa for confirmada.
+    if (u) {
+      const compareResult = await bcrypt.compare(senha, u.senha_hash);
+      console.log(`🔍 DEBUG login: found=true ativo=${u.ativo} senhaLen=${senha.length} senhaFp=${crypto.createHash("sha256").update(senha).digest("hex").slice(0,12)} hashFp=${crypto.createHash("sha256").update(u.senha_hash).digest("hex").slice(0,12)} compare=${compareResult}`);
+    } else {
+      console.log(`🔍 DEBUG login: usuário não encontrado para email ${JSON.stringify(email.toLowerCase().trim())}`);
+    }
     if (!u || !u.ativo || !(await bcrypt.compare(senha, u.senha_hash)))
       return res.status(401).json({ ok: false, error: "Credenciais inválidas" });
     const token = jwt.sign({ sub: u.id, role: u.role }, process.env.JWT_SECRET, { expiresIn: "8h" });
