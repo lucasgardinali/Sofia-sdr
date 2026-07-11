@@ -519,6 +519,7 @@ async function runFollowUpJob() {
         ORDER BY criado_em DESC LIMIT 1
       ) lm ON true
       WHERE c.status = 'aberta'
+        AND ct.etapa_funil = 'novo_lead'
         AND NOT (c.followup_1h AND c.followup_24h AND c.followup_7d)
         AND lm.criado_em < NOW() - INTERVAL '55 minutes'
     `);
@@ -625,8 +626,8 @@ app.post("/webhook/whatsapp", async (req, res) => {
       loadOrCreateContact(tenantId, phone),
     ]);
 
-    if (contact.etapa_funil === "desqualificado") {
-      console.log(`⏭️ Lead desqualificado — ignorando: ${phone}`);
+    if (contact.etapa_funil === "desqualificado" || contact.etapa_funil === "demo") {
+      console.log(`⏭️ Lead ${contact.etapa_funil === "demo" ? "já com reunião agendada — time comercial assume" : "desqualificado"} — ignorando: ${phone}`);
       return;
     }
 
@@ -637,14 +638,10 @@ app.post("/webhook/whatsapp", async (req, res) => {
 
     const history = await loadRecentMessages(conversation.id);
 
-    const systemWithContext = contact.etapa_funil === "demo"
-      ? agentConfig.persona_prompt + "\n\nNOTA: Este lead já tem reunião agendada. Confirme detalhes e seja prestativa. NÃO use [LQ] ou [RA] novamente."
-      : agentConfig.persona_prompt;
-
     const response = await anthropic.messages.create({
       model:      "claude-sonnet-4-6",
       max_tokens: 500,
-      system:     systemWithContext,
+      system:     agentConfig.persona_prompt,
       messages:   history,
     });
 
@@ -656,6 +653,7 @@ app.post("/webhook/whatsapp", async (req, res) => {
     if (markers.reuniaoAgendada && contact.etapa_funil !== "demo") {
       console.log(`📅 Reunião agendada: ${phone}`);
       await updateContactEtapaFunil(contact.id, "demo");
+      await archiveConversation(conversation.id);
       await notifyManager(phone, contact.nome, history, "reuniao", agentConfig.manager_phone, creds);
     } else if (markers.qualificado && contact.etapa_funil === "novo_lead") {
       console.log(`🎯 Lead qualificado: ${phone}`);
