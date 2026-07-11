@@ -774,8 +774,15 @@ app.post("/api/public/leads", publicLeadsLimiter, async (req, res) => {
 
   const nome            = String(req.body?.nome ?? "").trim().slice(0, 150);
   const estabelecimento = String(req.body?.estabelecimento ?? "").trim().slice(0, 150);
-  const telefone         = String(req.body?.whatsapp ?? "").replace(/\D/g, "");
   const tipo              = String(req.body?.tipo ?? "").trim();
+
+  // Usuário real costuma digitar/colar o número com o DDI (+55) na frente —
+  // é assim que o WhatsApp e a agenda de contatos exibem. Normaliza pro
+  // mesmo formato (DDD + número, sem DDI) que a Sofia já grava via webhook.
+  let telefone = String(req.body?.whatsapp ?? "").replace(/\D/g, "");
+  if ((telefone.length === 12 || telefone.length === 13) && telefone.startsWith("55")) {
+    telefone = telefone.slice(2);
+  }
 
   if (!nome || !estabelecimento || !telefone || !tipo)
     return res.status(400).json({ ok: false, error: "Preencha todos os campos" });
