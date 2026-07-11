@@ -756,6 +756,26 @@ const SEGMENTOS_LANDING = [
   "Padaria / Confeitaria", "Bar / Boteco", "Food truck", "Delivery", "Outro",
 ];
 
+// Labels que o fanfave-diagnostico usa e não batem exatamente com
+// SEGMENTOS_LANDING — mapeados pro mais próximo. Qualquer outro valor
+// desconhecido (ex: "Sorveteria/Açaiteria", ou o fallback "Food service" do
+// diagnóstico) cai em "Outro" via normalizarTipo(), nunca gera 400.
+const TIPO_ALIASES = {
+  "Bar/Boteco": "Bar / Boteco",
+  "Cafeteria/Padaria": "Cafeteria",
+  "Lanchonete/Fast Food": "Lanchonete",
+  "Food Truck/Delivery": "Food truck",
+};
+
+function normalizarTipo(tipo) {
+  if (SEGMENTOS_LANDING.includes(tipo)) return tipo;
+  if (TIPO_ALIASES[tipo]) return TIPO_ALIASES[tipo];
+  return "Outro";
+}
+
+// Origem só pode ser um destes — nunca aceita o que vier cru no payload.
+const ORIGENS_PUBLICAS = ["landing", "diagnostico"];
+
 const publicLeadsLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
   max: 8,
@@ -774,7 +794,10 @@ app.post("/api/public/leads", publicLeadsLimiter, async (req, res) => {
 
   const nome            = String(req.body?.nome ?? "").trim().slice(0, 150);
   const estabelecimento = String(req.body?.estabelecimento ?? "").trim().slice(0, 150);
-  const tipo              = String(req.body?.tipo ?? "").trim();
+  const tipo              = normalizarTipo(String(req.body?.tipo ?? "").trim());
+  const cidade            = String(req.body?.cidade ?? "").trim().slice(0, 100);
+  const notas              = String(req.body?.notas ?? "").trim().slice(0, 500);
+  const origem              = ORIGENS_PUBLICAS.includes(req.body?.origem) ? req.body.origem : "landing";
 
   // Usuário real costuma digitar/colar o número com o DDI (+55) na frente —
   // é assim que o WhatsApp e a agenda de contatos exibem. Normaliza pro
@@ -788,15 +811,13 @@ app.post("/api/public/leads", publicLeadsLimiter, async (req, res) => {
     return res.status(400).json({ ok: false, error: "Preencha todos os campos" });
   if (telefone.length < 10 || telefone.length > 11)
     return res.status(400).json({ ok: false, error: "WhatsApp inválido" });
-  if (!SEGMENTOS_LANDING.includes(tipo))
-    return res.status(400).json({ ok: false, error: "Segmento inválido" });
 
   try {
     await db.query(
       `INSERT INTO contacts (tenant_id, nome, telefone, etapa_funil, campos_customizados)
        VALUES ($1,$2,$3,'novo_lead',$4)
        ON CONFLICT (tenant_id, telefone) DO UPDATE SET atualizado_em = NOW()`,
-      [PUBLIC_LANDING_TENANT_ID, nome, telefone, { estabelecimento, segmento: tipo, origem: "landing" }]
+      [PUBLIC_LANDING_TENANT_ID, nome, telefone, { estabelecimento, segmento: tipo, origem, cidade: cidade || undefined, notas: notas || undefined }]
     );
     res.status(201).json({ ok: true });
   } catch (err) {
