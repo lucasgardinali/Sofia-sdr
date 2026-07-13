@@ -10,8 +10,11 @@ import rateLimit from "express-rate-limit";
 const app = express();
 // Railway termina TLS na borda e repassa por HTTP puro — sem isso,
 // req.protocol sempre reporta "http", mesmo em produção (ex: a webhookUrl
-// gerada por /api/whatsapp/connect saía errada).
-app.set("trust proxy", true);
+// gerada por /api/whatsapp/connect saía errada). Usamos "1" (confia só o
+// primeiro salto — o edge do Railway), não "true" (confiaria em qualquer
+// X-Forwarded-For forjado por qualquer cliente, quebrando o rate limit do
+// /api/public/leads — express-rate-limit recusa "true" por esse motivo).
+app.set("trust proxy", 1);
 app.use(cors());
 app.use(express.json());
 
